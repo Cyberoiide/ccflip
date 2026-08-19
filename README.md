@@ -99,6 +99,13 @@ ccflip rewrites the flag when dropping to Bedrock.
 - Enterprise/spend accounts have no readable 5h/7d windows; cswap auto
   fails over off them if they're the default login. Keep the other accounts
   `cswap disable`d if the default must stay put.
+- Bedrock model ids come in four forms (in-region `anthropic.X`, geo
+  `eu./us./au.`, `global.`) and IAM grants are per inference-profile ARN.
+  Use ALIAS forms (`claude-opus-5[1m]`) in bedrock.env and the override —
+  Claude Code resolves the right prefix for `AWS_REGION` and handles the
+  `[1m]` context variant. A 403 means the role lacks that profile ARN
+  (not a bad name); force a prefix with `ANTHROPIC_BEDROCK_REGION_PREFIX`
+  or pin a full id in `CCFLIP_BEDROCK_MODEL_OVERRIDE` if IAM demands it.
 
 ## Usage tracking (tokscale)
 
