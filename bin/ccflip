@@ -9,7 +9,13 @@
 # ~/.claude/bedrock.env holds the per-host Bedrock config; source it
 # manually to force Bedrock. Proactive rotation of the default login is the
 # cswap-auto daemon's job — this launcher only routes.
+#
+# Also serves as t3code's claude binary (settings -> Claude -> binary path):
+# t3code spawns it per session with the workspace as cwd, so mapped dirs and
+# the Bedrock tier apply to t3code sessions too. GUI spawns may carry a
+# minimal PATH, hence the prepend.
 set -euo pipefail
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
 
 BEDROCK_ENV="${CCFLIP_BEDROCK_ENV:-$HOME/.claude/bedrock.env}"
 MAPPINGS="${CCFLIP_MAPPINGS:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-swap/mappings.json}"
