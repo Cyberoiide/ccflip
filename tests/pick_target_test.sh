@@ -8,7 +8,9 @@ fixture='{"schemaVersion":1,"activeAccountNumber":1,"accounts":[
   "usage":{"fiveHour":{"pct":97.0,"resetsAt":"x"},"sevenDay":{"pct":40.0,"resetsAt":"x"}}},
  {"number":2,"email":"b@qm.io","active":false,"usageStatus":"ok",
   "usage":{"fiveHour":{"pct":10.0,"resetsAt":"x"},"sevenDay":{"pct":20.0,"resetsAt":"x"}}},
- {"number":3,"email":"c@dead.io","active":false,"usageStatus":"token_expired","usage":null,"disabled":true}
+ {"number":3,"email":"c@dead.io","active":false,"usageStatus":"token_expired","usage":null,"disabled":true},
+ {"number":4,"email":"d@api.com","active":false,"usageStatus":"ok",
+  "usage":{"spend":{"used":14.12,"limit":100.0}}}
 ]}'
 
 # shellcheck source=/dev/null
@@ -18,4 +20,9 @@ THRESHOLD=95
 [[ "$(pick_target 1 <<<"$fixture")" == "2" ]]  # exhausted 5h window -> best healthy
 [[ -z "$(pick_target 2 <<<"$fixture")" ]]      # healthy -> no switch
 [[ "$(pick_target 3 <<<"$fixture")" == "2" ]]  # dead token -> best healthy
+
+# Spend-only (API billing) accounts are never rotation targets: with account 2
+# also exhausted, the only remaining candidate is 4 -> must pick nothing.
+allspent=$(jq '.accounts[1].usage.fiveHour.pct = 99' <<<"$fixture")
+[[ -z "$(pick_target 1 <<<"$allspent")" ]]
 echo OK

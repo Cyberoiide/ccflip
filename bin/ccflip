@@ -28,5 +28,11 @@ if [[ $rc -eq 3 ]]; then
     echo "ccflip: all accounts exhausted and no $BEDROCK_ENV — session will pause at the limit" >&2
 fi
 
+# Subscription path: a stale Bedrock env (shell that sourced bedrock.env,
+# process started under the old always-on settings) must not leak through —
+# cswap scrubs auth-token overrides but not the Bedrock switches.
+unset CLAUDE_CODE_USE_BEDROCK AWS_BEARER_TOKEN_BEDROCK \
+      ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_MODEL
+
 # Mapped dir -> pinned session for its account; unmapped -> plain claude.
 exec cswap run -- "$@"
