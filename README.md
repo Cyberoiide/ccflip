@@ -100,6 +100,21 @@ against `cswap import` (token refresh transfers re-activate the replaced
 slot and clear its disabled flag), manual slips, and anything else that
 drifts the default onto a personal account.
 
+## Spend budget (enterprise accounts)
+
+Spend-based accounts expose `usage.spend.pct` instead of 5h/7d windows;
+cswap polls it but never acts on it. ccflip does, at two lines:
+
+- **`CCFLIP_SPEND_ALERT_PCT` (default 90)** — the watcher journals a
+  `SPEND ALERT` and fires a desktop notification (when `notify-send`
+  exists), once per breach, re-armed if spend drops back.
+- **`CCFLIP_SPEND_THRESHOLD` (default 97)** — past this the account stops
+  counting as usable: the launcher routes new sessions to the next tier
+  (other account, then Bedrock) and the watcher stops rotating onto it,
+  before requests start failing at the cap.
+
+Set either in the environment or in `policy.env`.
+
 ## Gotchas
 
 - Never run `cswap run` from a shell still carrying `CLAUDE_CODE_USE_BEDROCK=1`:
