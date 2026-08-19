@@ -81,6 +81,9 @@ ccflip rewrites the flag when dropping to Bedrock.
 
 ## Seeing which account is in use
 
+- `ccflip budget` — the default account's real dollar meters: the seat's
+  included monthly pool (a `limit_dollars` bucket cswap doesn't parse — the
+  meter that actually drains) plus the extra-usage overflow budget.
 - `ccflip who` — every running claude session: PID, account
   (`bedrock` / pinned-session slug / default email), cwd. This is the way
   to see what a t3code session runs on — t3code's UI never shows the CLI
