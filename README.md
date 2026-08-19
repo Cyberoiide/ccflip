@@ -90,6 +90,16 @@ ccflip rewrites the flag when dropping to Bedrock.
 - Statusline chip — `bedrock`, the pinned session slug, or the default email.
 - `journalctl --user -u ccflip-watch -u cswap-auto` — every rotation, when, why.
 
+## Account containment policy
+
+`~/.config/ccflip/policy.env` (see `policy.env.example`) declares which
+account the default login must be and which accounts are pinned-only.
+ccflip-watch enforces it every tick: a pinned-only account found as the
+default login is switched away within a minute and re-disabled. This guards
+against `cswap import` (token refresh transfers re-activate the replaced
+slot and clear its disabled flag), manual slips, and anything else that
+drifts the default onto a personal account.
+
 ## Gotchas
 
 - Never run `cswap run` from a shell still carrying `CLAUDE_CODE_USE_BEDROCK=1`:

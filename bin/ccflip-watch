@@ -17,8 +17,36 @@ INTERVAL="${CCFLIP_WATCH_INTERVAL:-60}"
 # Later than cswap auto's default 90: the watcher is the last-resort lever.
 THRESHOLD="${CCFLIP_WATCH_THRESHOLD:-95}"
 SESSIONS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/claude-swap/sessions"
+POLICY="${CCFLIP_POLICY:-$HOME/.config/ccflip/policy.env}"
 
 log() { printf '%s %s\n' "$(date -Is)" "$*"; }
+
+# Account containment guard. `cswap import` re-activates a replaced slot and
+# clears its disabled flag, and nothing else re-checks intent — so a token
+# refresh can silently make a pinned-only (personal) account the default
+# login. Enforce the declared policy every tick: a CCFLIP_PINNED_ONLY account
+# found active is switched away from, and one found enabled is re-disabled.
+enforce_policy() {
+    [[ -f "$POLICY" ]] || return 0
+    # shellcheck source=/dev/null
+    . "$POLICY"
+    [[ -n "${CCFLIP_PINNED_ONLY:-}" ]] || return 0
+    local list active a
+    list=$(cswap list --json 2>/dev/null) || return 0
+    active=$(jq -r '[.accounts[] | select(.active == true) | .email] | first // empty' <<<"$list")
+    for a in $CCFLIP_PINNED_ONLY; do
+        if [[ "$active" == "$a" && -n "${CCFLIP_DEFAULT_ACCOUNT:-}" ]]; then
+            if cswap switch "$CCFLIP_DEFAULT_ACCOUNT" >/dev/null 2>&1; then
+                log "policy: pinned-only $a was the default login -> switched back to $CCFLIP_DEFAULT_ACCOUNT"
+            else
+                log "policy: pinned-only $a is the default login and switch to $CCFLIP_DEFAULT_ACCOUNT FAILED"
+            fi
+        fi
+        if jq -e --arg e "$a" '.accounts[] | select(.email == $e and (.disabled | not))' <<<"$list" >/dev/null 2>&1; then
+            cswap disable "$a" >/dev/null 2>&1 && log "policy: re-disabled pinned-only account $a"
+        fi
+    done
+}
 
 # Emit the target account number for a session, or nothing.
 # Exhausted = usageStatus not ok, or either window >= THRESHOLD.
@@ -66,6 +94,7 @@ tick() {
 
 log "ccflip-watch started (interval=${INTERVAL}s threshold=${THRESHOLD}%)"
 while :; do
+    enforce_policy
     tick
     sleep "$INTERVAL"
 done
