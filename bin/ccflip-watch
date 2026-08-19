@@ -22,23 +22,26 @@ log() { printf '%s %s\n' "$(date -Is)" "$*"; }
 
 # Emit the target account number for a session, or nothing.
 # Exhausted = usageStatus not ok, or either window >= THRESHOLD.
-# Target    = enabled ok account with the most headroom, itself under THRESHOLD.
-# Spend-only accounts (API billing, no 5h/7d windows) are never targets —
-# same policy as cswap auto's default --no-include-api-key-accounts.
+# Target    = enabled ok windowed account with the most headroom; a
+# spend-based account (enterprise/API billing, no 5h/7d windows) is the
+# LAST-RESORT target — it costs real dollars, so windowed quota goes first.
+# Accounts with no usage data at all are never targets (fail-safe hold).
 pick_target() { # $1=current account number  (stdin: cswap list --json)
     jq -r --argjson num "$1" --argjson thr "$THRESHOLD" '
+        def windowed: .usage.fiveHour != null;
+        def spendonly: (.usage != null) and (.usage.fiveHour == null);
         def worst: [.usage.fiveHour.pct, .usage.sevenDay.pct] | max;
         .accounts as $a
         | ($a[] | select(.number == $num)) as $cur
         | if ($cur.usageStatus != "ok")
-             or ($cur.usage != null and ($cur | worst) >= $thr)
+             or (($cur | windowed) and ($cur | worst) >= $thr)
           then [ $a[]
                  | select(.number != $num
                           and (.disabled | not)
                           and .usageStatus == "ok"
-                          and .usage.fiveHour != null
-                          and (worst < $thr)) ]
-               | sort_by(worst) | first | .number // empty
+                          and ((windowed and worst < $thr) or spendonly)) ]
+               | sort_by([(if windowed then 0 else 1 end), (worst // -1)])
+               | first | .number // empty
           else empty end'
 }
 
