@@ -1,0 +1,30 @@
+# Tag v* -> build a static musl binary -> GitHub release.
+# `ccflip update` and cargo-binstall both consume these assets; the name
+# must keep matching Cargo.toml's [package.metadata.binstall] pkg-url.
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  ASSET: ccflip-x86_64-unknown-linux-musl.tgz
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup toolchain install stable --profile minimal
+      - run: rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - run: tar czf "$ASSET" -C target/x86_64-unknown-linux-musl/release ccflip
+      # aarch64: add a matrix entry on ubuntu-24.04-arm when a host needs it.
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}

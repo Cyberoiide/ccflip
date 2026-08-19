@@ -1,0 +1,26 @@
+[package]
+name = "ccflip"
+version = "0.1.0"
+edition = "2024"
+description = "Per-project Claude Code account routing with automatic fallback to Bedrock"
+repository = "https://github.com/Cyberoiide/ccflip"
+publish = false # niche + ToS-gray; install from GitHub releases, not crates.io
+
+[dependencies]
+anyhow = "1.0.104"
+self_update = { version = "0.44.0", default-features = false, features = ["ureq", "rustls", "archive-tar", "compression-flate2"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+# `cargo binstall --git https://github.com/Cyberoiide/ccflip ccflip`
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tgz"
+pkg-fmt = "tgz"
+
+[profile.release]
+strip = true
+lto = true
