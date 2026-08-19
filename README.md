@@ -7,17 +7,24 @@ a pinned-session watcher, and a statusline chip.
 
 ## What it does
 
-| Tier | Backing | When |
-|------|---------|------|
-| 1 | Subscription account pinned to the current dir (`cswap map`) | Mapped dirs (e.g. `~/quiet-mind` → quiet-mind.io account) |
-| 2 | Other subscription account(s) | Rotated onto automatically as windows fill |
-| 3 | Bedrock (`CLAUDE_CODE_USE_BEDROCK=1`) | Every subscription account exhausted |
+| Where | Tier order |
+|-------|-----------|
+| Mapped dir (`cswap map`, e.g. `~/quiet-mind`) | pinned account → any other enabled usable account → Bedrock |
+| Anywhere else | default login → Bedrock |
+
+Account containment: `cswap disable <email>` keeps an account out of
+auto-rotation and out of ccflip's "other usable account" pool, while its
+own mapped dirs still use it — e.g. a personal account that must never
+serve work sessions. Spend-based accounts (enterprise/API billing) expose
+no 5h/7d windows; they count as usable until their token dies, and are
+never auto-rotated onto by the watcher.
 
 Three moving parts:
 
-- **`ccflip`** — launcher. Rotates the default login if needed, drops to
-  Bedrock when cswap reports every account blocked (exit code 3), otherwise
-  hands off to `cswap run` (mapped dir → pinned account, else default login).
+- **`ccflip`** — launcher. Routes per the table above by reading
+  `cswap list --json` and cswap's directory mappings; scrubs stale Bedrock
+  env off subscription launches; drops to Bedrock (`~/.claude/bedrock.env`)
+  only when no subscription account is usable for this directory.
 - **`cswap auto`** (upstream, systemd unit) — rotates the *default* login
   before it hits a limit. Covers every plain `claude` launch, including
   t3code-spawned sessions — t3code needs no changes and sees nothing.

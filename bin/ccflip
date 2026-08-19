@@ -1,38 +1,91 @@
 #!/usr/bin/env bash
-# ccflip — launch Claude Code on the best available "account".
+# ccflip — launch Claude Code on the right "account" for this directory.
 #
-# Tier 1/2: Claude subscription accounts, managed by claude-swap.
-#           A directory mapped with `cswap map` gets its pinned account
-#           (session mode); anywhere else runs the default login.
-# Tier 3:   Bedrock, only when every subscription account is exhausted
-#           (cswap exit code 3). Per-host config in ~/.claude/bedrock.env.
+# Mapped dir (cswap map):  its pinned account -> any other enabled usable
+#                          account -> Bedrock.
+# Anywhere else:           the default login (cswap auto guards it) ->
+#                          Bedrock only when no subscription account works.
+#
+# ~/.claude/bedrock.env holds the per-host Bedrock config; source it
+# manually to force Bedrock. Proactive rotation of the default login is the
+# cswap-auto daemon's job — this launcher only routes.
 set -euo pipefail
 
 BEDROCK_ENV="${CCFLIP_BEDROCK_ENV:-$HOME/.claude/bedrock.env}"
+MAPPINGS="${CCFLIP_MAPPINGS:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-swap/mappings.json}"
+THRESHOLD="${CCFLIP_THRESHOLD:-99}" # launcher acts only on truly-dry windows
 
-if ! command -v cswap >/dev/null 2>&1; then
-    exec claude "$@"
-fi
+command -v cswap >/dev/null 2>&1 || exec claude "$@"
+LIST=$(cswap list --json 2>/dev/null) || exec claude "$@"
 
-# --once also rotates the default login if it is near its limit (exit 0).
-# Exit 3 = blocked: no subscription account has quota left right now.
-rc=0
-cswap auto --once >/dev/null 2>&1 || rc=$?
-if [[ $rc -eq 3 ]]; then
+# Spend-based accounts (enterprise/API billing) report no 5h/7d windows:
+# usable until their token dies — their spend cap is invisible to us.
+usable() { # $1 = jq selector for one account row
+    jq -e --argjson thr "$THRESHOLD" \
+       "$1 | select(.usageStatus == \"ok\")
+           | (.usage.fiveHour == null)
+             or ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < \$thr)" \
+       <<<"$LIST" >/dev/null 2>&1
+}
+
+go_subscription() { # $@ = cswap run args
+    # A stale Bedrock env (shell that sourced bedrock.env, process started
+    # under old always-on settings) must not leak through — cswap scrubs
+    # auth-token overrides but not the Bedrock switches.
+    unset CLAUDE_CODE_USE_BEDROCK AWS_BEARER_TOKEN_BEDROCK \
+          ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_MODEL
+    exec cswap run "$@"
+}
+
+go_bedrock() { # $1 = reason, rest = claude args
+    local reason=$1; shift
     if [[ -f "$BEDROCK_ENV" ]]; then
-        echo "ccflip: all subscription accounts exhausted -> Bedrock" >&2
+        echo "ccflip: $reason -> Bedrock" >&2
         # shellcheck source=/dev/null
         . "$BEDROCK_ENV"
         exec claude "$@"
     fi
-    echo "ccflip: all accounts exhausted and no $BEDROCK_ENV — session will pause at the limit" >&2
+    echo "ccflip: $reason and no $BEDROCK_ENV — launching anyway" >&2
+    go_subscription -- "$@"
+}
+
+mapped_email=$(jq -r --arg pwd "$PWD" '
+    (.mappings // {}) | to_entries
+    | map(.key as $k | select(($k == $pwd) or ($pwd | startswith($k + "/"))))
+    | sort_by(.key | length) | last | .value.email // empty' \
+    "$MAPPINGS" 2>/dev/null || true)
+
+if [[ -n "$mapped_email" ]]; then
+    if usable ".accounts[] | select(.email == \"$mapped_email\")"; then
+        go_subscription -- "$@" # bare run resolves the mapping itself
+    fi
+    # Pinned account is dry: any other enabled usable account may serve this
+    # dir (disabled accounts are dir-pinned only — never borrowed here).
+    alt=$(jq -r --arg skip "$mapped_email" --argjson thr "$THRESHOLD" '
+        [.accounts[] | select(.email != $skip and (.disabled | not)
+                              and .usageStatus == "ok"
+                              and ((.usage.fiveHour == null)
+                                   or ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr)))]
+        | sort_by(.usage.fiveHour.pct // -1) | first | .email // empty' <<<"$LIST")
+    if [[ -n "$alt" ]]; then
+        echo "ccflip: $mapped_email exhausted -> $alt" >&2
+        go_subscription "$alt" -- "$@"
+    fi
+    go_bedrock "every usable subscription account exhausted" "$@"
 fi
 
-# Subscription path: a stale Bedrock env (shell that sourced bedrock.env,
-# process started under the old always-on settings) must not leak through —
-# cswap scrubs auth-token overrides but not the Bedrock switches.
-unset CLAUDE_CODE_USE_BEDROCK AWS_BEARER_TOKEN_BEDROCK \
-      ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_MODEL
-
-# Mapped dir -> pinned session for its account; unmapped -> plain claude.
-exec cswap run -- "$@"
+# Unmapped dir: the default login, unless it is dead/dry. If another enabled
+# account could replace it, launch anyway — the cswap-auto daemon moves the
+# default login, not us.
+active=$(jq -r '.activeAccountNumber' <<<"$LIST")
+if usable ".accounts[] | select(.number == $active)"; then
+    go_subscription -- "$@"
+fi
+if jq -e --argjson thr "$THRESHOLD" '
+      [.accounts[] | select((.disabled | not) and .usageStatus == "ok"
+                            and ((.usage.fiveHour == null)
+                                 or ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr)))]
+      | length > 0' <<<"$LIST" >/dev/null; then
+    go_subscription -- "$@"
+fi
+go_bedrock "no usable subscription account" "$@"
