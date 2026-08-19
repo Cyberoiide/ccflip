@@ -17,6 +17,25 @@
 set -euo pipefail
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
 
+# `ccflip who` — which account is every running claude session on?
+# bedrock | <n-email-slug> (pinned session) | default-login email.
+# ponytail: /proc scan, Linux only; matches the native-installer binary
+# (exe under .../claude/versions/) and anything literally named claude.
+if [[ "${1:-}" == "who" ]]; then
+    default_acct=$(jq -r '.oauthAccount.emailAddress // "?"' "$HOME/.claude.json" 2>/dev/null)
+    printf '%-9s %-45s %s\n' PID ACCOUNT CWD
+    for p in /proc/[0-9]*; do
+        exe=$(readlink "$p/exe" 2>/dev/null) || continue
+        [[ "$exe" == */claude/versions/* || "${exe##*/}" == claude ]] || continue
+        envs=$(tr '\0' '\n' < "$p/environ" 2>/dev/null) || continue
+        if grep -q '^CLAUDE_CODE_USE_BEDROCK=' <<<"$envs"; then acct=bedrock
+        elif cfg=$(grep -m1 '^CLAUDE_CONFIG_DIR=' <<<"$envs"); then acct=$(basename "${cfg#*=}")
+        else acct=$default_acct; fi
+        printf '%-9s %-45s %s\n' "${p#/proc/}" "$acct" "$(readlink "$p/cwd" 2>/dev/null)"
+    done
+    exit 0
+fi
+
 BEDROCK_ENV="${CCFLIP_BEDROCK_ENV:-$HOME/.claude/bedrock.env}"
 MAPPINGS="${CCFLIP_MAPPINGS:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-swap/mappings.json}"
 THRESHOLD="${CCFLIP_THRESHOLD:-99}" # launcher acts only on truly-dry windows

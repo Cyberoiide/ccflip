@@ -64,11 +64,41 @@ Then on each host:
 
 Launch with `ccflip` in terminals. t3code keeps launching plain `claude`.
 
+## t3code integration
+
+t3code resolves its claude binary from a per-environment **binary path**
+setting (Settings → Claude). Point it at `~/.local/bin/ccflip` on every
+machine (the local app and each `npx t3 connect` host are separate
+environments with separate settings). t3code spawns per session with the
+workspace as cwd, so dir-pinning and the Bedrock tier apply; settings-wise
+nothing else changes and running sessions are untouched.
+
+t3code always passes an explicit `--model` flag, which beats every env var
+and is not remapped by slot vars (`ANTHROPIC_DEFAULT_FABLE_MODEL` etc.).
+On a host whose IAM role lacks that model, set
+`CCFLIP_BEDROCK_MODEL_OVERRIDE="claude-opus-5[1m]"` in `bedrock.env` —
+ccflip rewrites the flag when dropping to Bedrock.
+
 ## Seeing which account is in use
 
+- `ccflip who` — every running claude session: PID, account
+  (`bedrock` / pinned-session slug / default email), cwd. This is the way
+  to see what a t3code session runs on — t3code's UI never shows the CLI
+  statusline. (Reads spawn-time env: sessions that went Bedrock via a
+  legacy settings.json env block, not via ccflip, show as subscription.)
 - `cswap status` / `cswap list` — active account + every window's usage.
 - Statusline chip — `bedrock`, the pinned session slug, or the default email.
 - `journalctl --user -u ccflip-watch -u cswap-auto` — every rotation, when, why.
+
+## Gotchas
+
+- Never run `cswap run` from a shell still carrying `CLAUDE_CODE_USE_BEDROCK=1`:
+  cswap's validity probe answers "bedrock" and it deletes the session profile
+  with a misleading "log in and re-add" error. ccflip scrubs those vars; raw
+  `cswap run` does not.
+- Enterprise/spend accounts have no readable 5h/7d windows; cswap auto
+  fails over off them if they're the default login. Keep the other accounts
+  `cswap disable`d if the default must stay put.
 
 ## Usage tracking (tokscale)
 
