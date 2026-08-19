@@ -22,17 +22,37 @@ case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$P
 # arrives under an internal codename with limit_dollars — print any such
 # bucket generically.
 if [[ "${1:-}" == "budget" ]]; then
-    tok=$(jq -r '.claudeAiOauth.accessToken // empty' "$HOME/.claude/.credentials.json" 2>/dev/null)
-    [[ -n "$tok" ]] || { echo "ccflip: no oauth token in default profile" >&2; exit 1; }
-    curl -s -m 10 https://api.anthropic.com/api/oauth/usage \
-         -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" \
-    | jq -r '
-        (to_entries[] | select(.value.limit_dollars? != null)
-         | "\(.key)\t$\(.value.used_dollars) / $\(.value.limit_dollars)\t\(.value.utilization|round)%\tresets \(.value.resets_at // "?")"),
-        (.extra_usage // empty
-         | "extra_usage (overflow)\t$\(.used_credits/100) / $\(.monthly_limit/100)\t\(.utilization)%\tmonthly")' \
-    | column -t -s $'\t'
-    exit "${PIPESTATUS[0]}"
+    {
+        tok=$(jq -r '.claudeAiOauth.accessToken // empty' "$HOME/.claude/.credentials.json" 2>/dev/null)
+        if [[ -n "$tok" ]]; then
+            curl -s -m 10 https://api.anthropic.com/api/oauth/usage \
+                 -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" \
+            | jq -r '
+                (to_entries[] | select(.value.limit_dollars? != null)
+                 | "\(.key)\t$\(.value.used_dollars) / $\(.value.limit_dollars)\t\(.value.utilization|round)%\tresets \(.value.resets_at // "?")"),
+                (.extra_usage // empty
+                 | "extra_usage (overflow)\t$\(.used_credits/100) / $\(.monthly_limit/100)\t\(.utilization)%\tmonthly")'
+        else
+            echo "oauth: no token in default profile"
+        fi
+        # Bedrock tier: YOUR consumption only — the AWS account is shared and
+        # Cost Explorer cannot split by IAM principal, so sum this machine's
+        # transcripts instead. Bedrock-served messages carry msg_bdrk_ ids.
+        # Tokens, not dollars — no invented pricing table.
+        find "$HOME/.claude/projects" \
+             "${XDG_DATA_HOME:-$HOME/.local/share}/claude-swap/sessions" \
+             -name '*.jsonl' -newermt "$(date +%Y-%m-01)" 2>/dev/null \
+        | xargs -r cat 2>/dev/null \
+        | jq -Rr 'fromjson? | select(.message.id? // "" | startswith("msg_bdrk_"))
+                  | .message.usage // empty
+                  | [(.output_tokens // 0),
+                     (.input_tokens // 0) + (.cache_creation_input_tokens // 0)
+                       + (.cache_read_input_tokens // 0)] | @tsv' 2>/dev/null \
+        | awk -F'\t' '{o+=$1; i+=$2; n++} END {
+              printf "bedrock (you, this host)\t%.2fM out / %.0fM in+cache\t%d msgs\tmonth-to-date\n",
+                     o/1e6, i/1e6, n}'
+    } | column -t -s $'\t'
+    exit 0
 fi
 
 # `ccflip who` — which account is every running claude session on?
