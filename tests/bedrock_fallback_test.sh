@@ -28,11 +28,11 @@ export LIST_FIXTURE="$T/list.json" CCFLIP_MAPPINGS="$T/mappings.json"
 printf 'export CLAUDE_CODE_USE_BEDROCK=1\n' > "$T/bedrock.env"
 
 # Fixture: 1=sia (spend-only, no windows), 2=qm (windowed, disabled, mapped).
-list() { # $1 = qm 5h pct, $2 = sia usageStatus
+list() { # $1 = qm 5h pct, $2 = sia usageStatus, $3 = sia spend pct (default 14)
     cat > "$LIST_FIXTURE" <<EOF
 {"schemaVersion":1,"activeAccountNumber":1,"accounts":[
  {"number":1,"email":"sia@x.com","active":true,"usageStatus":"$2",
-  "usage":{"spend":{"used":14.0,"limit":100.0}}},
+  "usage":{"spend":{"used":14.0,"limit":100.0,"pct":${3:-14}}}},
  {"number":2,"email":"qm@x.com","active":false,"usageStatus":"ok","disabled":true,
   "usage":{"fiveHour":{"pct":$1,"resetsAt":"x"},"sevenDay":{"pct":5,"resetsAt":"x"}}}
 ]}
@@ -53,6 +53,11 @@ check 'ARGS=-p hello' unmapped-ok-args
 list 5 token_expired
 "$CCFLIP" -p hello 2>/dev/null
 check 'VIA=claude BEDROCK=1' unmapped-dead
+
+# Unmapped + sia at 98% of its spend budget -> Bedrock before requests fail.
+list 5 ok 98
+"$CCFLIP" -p hello 2>/dev/null
+check 'VIA=claude BEDROCK=1' unmapped-spend-capped
 
 # Mapped subdir + qm fresh -> pinned account via bare run (disabled is fine
 # for its own dir).

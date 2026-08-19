@@ -10,13 +10,14 @@ fixture='{"schemaVersion":1,"activeAccountNumber":1,"accounts":[
   "usage":{"fiveHour":{"pct":10.0,"resetsAt":"x"},"sevenDay":{"pct":20.0,"resetsAt":"x"}}},
  {"number":3,"email":"c@dead.io","active":false,"usageStatus":"token_expired","usage":null,"disabled":true},
  {"number":4,"email":"d@api.com","active":false,"usageStatus":"ok",
-  "usage":{"spend":{"used":14.12,"limit":100.0}}},
+  "usage":{"spend":{"used":14.12,"limit":100.0,"pct":14.12}}},
  {"number":5,"email":"e@unknown.io","active":false,"usageStatus":"ok","usage":null}
 ]}'
 
 # shellcheck source=/dev/null
 source <(sed -n '/^pick_target()/,/^}/p' bin/ccflip-watch)
 THRESHOLD=95
+SPEND_THRESHOLD=97
 
 [[ "$(pick_target 1 <<<"$fixture")" == "2" ]]  # exhausted -> windowed beats spend
 [[ -z "$(pick_target 2 <<<"$fixture")" ]]      # healthy -> no switch
@@ -30,4 +31,8 @@ allspent=$(jq '.accounts[1].usage.fiveHour.pct = 99' <<<"$fixture")
 # Spend gone too (token dead) -> nothing left, hold.
 nospend=$(jq '.accounts[3].usageStatus = "token_expired"' <<<"$allspent")
 [[ -z "$(pick_target 1 <<<"$nospend")" ]]
+
+# Spend account near its cap (>= SPEND_THRESHOLD) is no longer a target.
+capped=$(jq '.accounts[3].usage.spend.pct = 98' <<<"$allspent")
+[[ -z "$(pick_target 1 <<<"$capped")" ]]
 echo OK

@@ -39,17 +39,19 @@ fi
 BEDROCK_ENV="${CCFLIP_BEDROCK_ENV:-$HOME/.claude/bedrock.env}"
 MAPPINGS="${CCFLIP_MAPPINGS:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-swap/mappings.json}"
 THRESHOLD="${CCFLIP_THRESHOLD:-99}" # launcher acts only on truly-dry windows
+# Spend-based accounts (enterprise budget) count as dry near their cap, so
+# routing falls to the next tier before requests start failing.
+SPEND_THRESHOLD="${CCFLIP_SPEND_THRESHOLD:-97}"
 
 command -v cswap >/dev/null 2>&1 || exec claude "$@"
 LIST=$(cswap list --json 2>/dev/null) || exec claude "$@"
 
-# Spend-based accounts (enterprise/API billing) report no 5h/7d windows:
-# usable until their token dies — their spend cap is invisible to us.
 usable() { # $1 = jq selector for one account row
-    jq -e --argjson thr "$THRESHOLD" \
+    jq -e --argjson thr "$THRESHOLD" --argjson sthr "$SPEND_THRESHOLD" \
        "$1 | select(.usageStatus == \"ok\")
-           | (.usage.fiveHour == null)
-             or ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < \$thr)" \
+           | ((.usage.fiveHour == null)
+              or ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < \$thr))
+             and ((.usage.spend == null) or (.usage.spend.pct < \$sthr))" \
        <<<"$LIST" >/dev/null 2>&1
 }
 
@@ -102,11 +104,12 @@ if [[ -n "$mapped_email" ]]; then
     fi
     # Pinned account is dry: any other enabled usable account may serve this
     # dir (disabled accounts are dir-pinned only — never borrowed here).
-    alt=$(jq -r --arg skip "$mapped_email" --argjson thr "$THRESHOLD" '
+    alt=$(jq -r --arg skip "$mapped_email" --argjson thr "$THRESHOLD" --argjson sthr "$SPEND_THRESHOLD" '
         [.accounts[] | select(.email != $skip and (.disabled | not)
                               and .usageStatus == "ok"
                               and ((.usage.fiveHour == null)
-                                   or ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr)))]
+                                   or ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr))
+                              and ((.usage.spend == null) or (.usage.spend.pct < $sthr)))]
         | sort_by(.usage.fiveHour.pct // -1) | first | .email // empty' <<<"$LIST")
     if [[ -n "$alt" ]]; then
         echo "ccflip: $mapped_email exhausted -> $alt" >&2
@@ -122,10 +125,11 @@ active=$(jq -r '.activeAccountNumber' <<<"$LIST")
 if usable ".accounts[] | select(.number == $active)"; then
     go_subscription -- "$@"
 fi
-if jq -e --argjson thr "$THRESHOLD" '
+if jq -e --argjson thr "$THRESHOLD" --argjson sthr "$SPEND_THRESHOLD" '
       [.accounts[] | select((.disabled | not) and .usageStatus == "ok"
                             and ((.usage.fiveHour == null)
-                                 or ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr)))]
+                                 or ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr))
+                            and ((.usage.spend == null) or (.usage.spend.pct < $sthr)))]
       | length > 0' <<<"$LIST" >/dev/null; then
     go_subscription -- "$@"
 fi
