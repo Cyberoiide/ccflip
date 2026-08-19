@@ -17,6 +17,24 @@
 set -euo pipefail
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
 
+# `ccflip budget` — the default account's REAL dollar meters. cswap only
+# parses extra_usage (the overflow budget); the seat's included monthly pool
+# arrives under an internal codename with limit_dollars — print any such
+# bucket generically.
+if [[ "${1:-}" == "budget" ]]; then
+    tok=$(jq -r '.claudeAiOauth.accessToken // empty' "$HOME/.claude/.credentials.json" 2>/dev/null)
+    [[ -n "$tok" ]] || { echo "ccflip: no oauth token in default profile" >&2; exit 1; }
+    curl -s -m 10 https://api.anthropic.com/api/oauth/usage \
+         -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" \
+    | jq -r '
+        (to_entries[] | select(.value.limit_dollars? != null)
+         | "\(.key)\t$\(.value.used_dollars) / $\(.value.limit_dollars)\t\(.value.utilization|round)%\tresets \(.value.resets_at // "?")"),
+        (.extra_usage // empty
+         | "extra_usage (overflow)\t$\(.used_credits/100) / $\(.monthly_limit/100)\t\(.utilization)%\tmonthly")' \
+    | column -t -s $'\t'
+    exit "${PIPESTATUS[0]}"
+fi
+
 # `ccflip who` — which account is every running claude session on?
 # bedrock | <n-email-slug> (pinned session) | default-login email.
 # ponytail: /proc scan, Linux only; matches the native-installer binary

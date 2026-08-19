@@ -23,23 +23,48 @@ SPEND_THRESHOLD="${CCFLIP_SPEND_THRESHOLD:-97}"
 
 log() { printf '%s %s\n' "$(date -Is)" "$*"; }
 
-# Warn once per breach when a spend-budget account (enterprise $ cap) crosses
-# the alert line — journal always, desktop notification when available.
+# Warn once per breach when any dollar meter crosses the alert line —
+# journal always, desktop notification when available. Re-arms if it drops.
 declare -A SPEND_ALERTED
+alert_pct() { # $1 = meter name, $2 = pct
+    local name=$1 pct=$2
+    if (( $(printf '%.0f' "$pct") >= SPEND_ALERT_PCT )); then
+        [[ -n "${SPEND_ALERTED[$name]:-}" ]] && return 0
+        SPEND_ALERTED[$name]=1
+        log "SPEND ALERT: $name at ${pct}% of its budget (alert line ${SPEND_ALERT_PCT}%)"
+        command -v notify-send >/dev/null 2>&1 && \
+            notify-send -u critical "ccflip" "$name at ${pct}% of spend budget" 2>/dev/null
+    else
+        unset "SPEND_ALERTED[$name]"
+    fi
+}
+
 spend_alert() { # stdin: cswap list --json
-    local line email pct
+    local email pct
     while IFS=$'\t' read -r email pct; do
-        if (( $(printf '%.0f' "$pct") >= SPEND_ALERT_PCT )); then
-            [[ -n "${SPEND_ALERTED[$email]:-}" ]] && continue
-            SPEND_ALERTED[$email]=1
-            log "SPEND ALERT: $email at ${pct}% of its budget (alert line ${SPEND_ALERT_PCT}%)"
-            command -v notify-send >/dev/null 2>&1 && \
-                notify-send -u critical "ccflip" "$email at ${pct}% of spend budget" 2>/dev/null
-        else
-            unset "SPEND_ALERTED[$email]"
-        fi
+        alert_pct "$email" "$pct"
     done < <(jq -r '.accounts[] | select(.usage.spend != null)
                     | [.email, .usage.spend.pct] | @tsv' 2>/dev/null)
+}
+
+# cswap only surfaces extra_usage (the overflow budget). The seat's included
+# monthly pool is a separate limit_dollars bucket on the oauth usage API —
+# poll it directly (every 5th tick, spare the endpoint) so "close to 100%"
+# means the meter that actually drains first.
+BUDGET_TICK=0
+budget_alert() {
+    (( BUDGET_TICK++ % 5 == 0 )) || return 0
+    local tok payload name pct
+    tok=$(jq -r '.claudeAiOauth.accessToken // empty' "$HOME/.claude/.credentials.json" 2>/dev/null)
+    [[ -n "$tok" ]] || return 0
+    payload=$(curl -s -m 10 https://api.anthropic.com/api/oauth/usage \
+              -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" 2>/dev/null) || return 0
+    while IFS=$'\t' read -r name pct; do
+        alert_pct "$name" "$pct"
+    done < <(jq -r '(to_entries[] | select(.value.limit_dollars? != null)
+                     | [.key, .value.utilization]),
+                    (.extra_usage // empty | ["extra_usage", .utilization])
+                    | @tsv' <<<"$payload" 2>/dev/null)
 }
 
 # Account containment guard. `cswap import` re-activates a replaced slot and
@@ -119,5 +144,6 @@ log "ccflip-watch started (interval=${INTERVAL}s threshold=${THRESHOLD}%)"
 while :; do
     enforce_policy
     tick
+    budget_alert
     sleep "$INTERVAL"
 done
