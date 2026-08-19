@@ -39,7 +39,7 @@ list() { # $1 = qm 5h pct, $2 = sia usageStatus
 EOF
 }
 map_qm() { echo '{"schemaVersion":1,"mappings":{"'"$1"'":{"email":"qm@x.com"}}}' > "$CCFLIP_MAPPINGS"; }
-check() { grep -qx "$1" "$OUT" || { echo "FAIL($2): wanted '$1', got:"; cat "$OUT"; exit 1; }; }
+check() { grep -qxF "$1" "$OUT" || { echo "FAIL($2): wanted '$1', got:"; cat "$OUT"; exit 1; }; }
 
 QMDIR="$T/quiet-mind"; mkdir -p "$QMDIR/darkfindr"; map_qm "$QMDIR"
 
@@ -69,6 +69,12 @@ check 'VIA=cswap-run ACCT=sia@x.com BEDROCK=unset' mapped-dry-alt
 list 100 token_expired
 "$CCFLIP" -p hello 2>/dev/null
 check 'VIA=claude BEDROCK=1' mapped-all-dry
+
+# Bedrock model override rewrites t3code's explicit --model flag.
+printf 'export CLAUDE_CODE_USE_BEDROCK=1\nexport CCFLIP_BEDROCK_MODEL_OVERRIDE="claude-opus-5[1m]"\n' > "$T/bedrock.env"
+list 100 token_expired
+"$CCFLIP" --model 'claude-fable-5[1m]' -p hello 2>/dev/null
+check 'ARGS=--model claude-opus-5[1m] -p hello' model-override
 
 # Mapped + everything dry + no bedrock.env -> still launches.
 rm "$T/bedrock.env"

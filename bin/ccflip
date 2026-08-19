@@ -49,6 +49,22 @@ go_bedrock() { # $1 = reason, rest = claude args
         echo "ccflip: $reason -> Bedrock" >&2
         # shellcheck source=/dev/null
         . "$BEDROCK_ENV"
+        # An explicit --model flag (t3code always sends one) beats every env
+        # var, and slot vars like ANTHROPIC_DEFAULT_FABLE_MODEL do not remap
+        # it. Hosts whose IAM role lacks the requested model set
+        # CCFLIP_BEDROCK_MODEL_OVERRIDE in bedrock.env; we rewrite the flag.
+        if [[ -n "${CCFLIP_BEDROCK_MODEL_OVERRIDE:-}" ]]; then
+            local out=() expect=0 a
+            for a in "$@"; do
+                if (( expect )); then out+=("$CCFLIP_BEDROCK_MODEL_OVERRIDE"); expect=0; continue; fi
+                case "$a" in
+                    --model)   out+=("$a"); expect=1 ;;
+                    --model=*) out+=("--model=$CCFLIP_BEDROCK_MODEL_OVERRIDE") ;;
+                    *)         out+=("$a") ;;
+                esac
+            done
+            set -- "${out[@]}"
+        fi
         exec claude "$@"
     fi
     echo "ccflip: $reason and no $BEDROCK_ENV — launching anyway" >&2
