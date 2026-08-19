@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# ccflip — launch Claude Code on the best available "account".
+#
+# Tier 1/2: Claude subscription accounts, managed by claude-swap.
+#           A directory mapped with `cswap map` gets its pinned account
+#           (session mode); anywhere else runs the default login.
+# Tier 3:   Bedrock, only when every subscription account is exhausted
+#           (cswap exit code 3). Per-host config in ~/.claude/bedrock.env.
+set -euo pipefail
+
+BEDROCK_ENV="${CCFLIP_BEDROCK_ENV:-$HOME/.claude/bedrock.env}"
+
+if ! command -v cswap >/dev/null 2>&1; then
+    exec claude "$@"
+fi
+
+# --once also rotates the default login if it is near its limit (exit 0).
+# Exit 3 = blocked: no subscription account has quota left right now.
+rc=0
+cswap auto --once >/dev/null 2>&1 || rc=$?
+if [[ $rc -eq 3 ]]; then
+    if [[ -f "$BEDROCK_ENV" ]]; then
+        echo "ccflip: all subscription accounts exhausted -> Bedrock" >&2
+        # shellcheck source=/dev/null
+        . "$BEDROCK_ENV"
+        exec claude "$@"
+    fi
+    echo "ccflip: all accounts exhausted and no $BEDROCK_ENV — session will pause at the limit" >&2
+fi
+
+# Mapped dir -> pinned session for its account; unmapped -> plain claude.
+exec cswap run -- "$@"

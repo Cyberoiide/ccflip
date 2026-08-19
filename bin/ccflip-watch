@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# ccflip-watch — mid-session account rotation for PINNED sessions.
+#
+# `cswap auto` (its own systemd unit) rotates only the default login and
+# deliberately skips accounts owned by live `cswap run` sessions. This watcher
+# covers the gap: when a pinned session's account exhausts a usage window, it
+# writes the best remaining account's credentials into that session's profile
+# (CLAUDE_CONFIG_DIR scopes every cswap path), which Claude Code picks up on
+# its next token refresh — no restart.
+#
+# Rotating a session profile with no live process is harmless: the next
+# `cswap run` re-seeds it. So no PID tracking here.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+INTERVAL="${CCFLIP_WATCH_INTERVAL:-60}"
+# Later than cswap auto's default 90: the watcher is the last-resort lever.
+THRESHOLD="${CCFLIP_WATCH_THRESHOLD:-95}"
+SESSIONS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/claude-swap/sessions"
+
+log() { printf '%s %s\n' "$(date -Is)" "$*"; }
+
+# Emit the target account number for a session, or nothing.
+# Exhausted = usageStatus not ok, or either window >= THRESHOLD.
+# Target    = enabled ok account with the most headroom, itself under THRESHOLD.
+pick_target() { # $1=current account number  (stdin: cswap list --json)
+    jq -r --argjson num "$1" --argjson thr "$THRESHOLD" '
+        def worst: [.usage.fiveHour.pct, .usage.sevenDay.pct] | max;
+        .accounts as $a
+        | ($a[] | select(.number == $num)) as $cur
+        | if ($cur.usageStatus != "ok")
+             or ($cur.usage != null and ($cur | worst) >= $thr)
+          then [ $a[]
+                 | select(.number != $num
+                          and (.disabled | not)
+                          and .usageStatus == "ok"
+                          and .usage != null
+                          and (worst < $thr)) ]
+               | sort_by(worst) | first | .number // empty
+          else empty end'
+}
+
+tick() {
+    [[ -d "$SESSIONS_DIR" ]] || return 0
+    local list dir name num target
+    list=$(cswap list --json 2>/dev/null) || return 0
+    for dir in "$SESSIONS_DIR"/*/; do
+        [[ -d "$dir" ]] || continue
+        name=$(basename "$dir")
+        num="${name%%-*}"
+        [[ "$num" =~ ^[0-9]+$ ]] || continue
+        target=$(pick_target "$num" <<<"$list") || continue
+        [[ -n "$target" ]] || continue
+        if CLAUDE_CONFIG_DIR="${dir%/}" cswap switch "$target" >/dev/null 2>&1; then
+            log "session '$name' exhausted -> switched profile to account $target"
+        else
+            log "session '$name': switch to account $target failed (will retry)"
+        fi
+    done
+}
+
+log "ccflip-watch started (interval=${INTERVAL}s threshold=${THRESHOLD}%)"
+while :; do
+    tick
+    sleep "$INTERVAL"
+done

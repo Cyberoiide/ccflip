@@ -1,0 +1,13 @@
+[Unit]
+Description=claude-swap auto-rotation of the default Claude Code login
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cswap auto --json
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
