@@ -79,6 +79,25 @@ On a host whose IAM role lacks that model, set
 `CCFLIP_BEDROCK_MODEL_OVERRIDE="claude-opus-5[1m]"` in `bedrock.env` —
 ccflip rewrites the flag when dropping to Bedrock.
 
+## Forcing a tier
+
+Policy routing is the default; explicit picks are always available:
+
+- `ccflip bedrock [claude args]` — launch on the Bedrock tier now.
+- `cswap run <alias|email> [-- claude args]` — launch pinned to a specific
+  account, this terminal only. (From a fresh shell — a stale
+  `CLAUDE_CODE_USE_BEDROCK` poisons cswap's validation probe.)
+
+## The claude shim
+
+Some spawners can't be pointed at ccflip (t3code's remote server ignores
+the desktop app's binary path). `bin/claude-shim`, installed as `claude`
+in a PATH dir that precedes the real binary (e.g. `~/.npm-global/bin`),
+routes any bare `claude` invocation through ccflip. It passes straight
+through to the real binary when the caller already chose: `CCFLIP_ROUTED`
+(ccflip descendants), `CLAUDE_CONFIG_DIR` (a `cswap run` session), or
+`CLAUDE_CODE_USE_BEDROCK` (forced Bedrock).
+
 ## Seeing which account is in use
 
 - `ccflip budget` — the default account's real dollar meters: the seat's
