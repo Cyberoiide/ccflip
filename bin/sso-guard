@@ -1,24 +1,37 @@
 #!/usr/bin/env bash
-# sso-guard — keep the AWS SSO session fresh so Bedrock sessions (and the
-# litellm gateway) never die mid-flight with "Token is expired".
+# sso-guard — keep every AWS SSO session fresh so Bedrock sessions (and the
+# litellm gateway, bastion tunnels, kubectl…) never die mid-flight with
+# "Token is expired".
 #
-# Silent while the access token has life. When it runs low, a plain STS call
-# lets botocore mint a fresh one from the SSO refresh token — no browser.
-# Only when the refresh token itself is dead does it open the browser login,
+# Sessions are discovered from ~/.aws/config ([sso-session] blocks plus the
+# first profile referencing each). Silent while an access token has life.
+# When one runs low, a plain STS call lets botocore mint a fresh token from
+# the SSO refresh token — no browser. Only when the refresh token itself is
+# dead does it open the browser login (one click against a live IdP session),
 # and only on a graphical session. Run from a systemd user timer.
 set -euo pipefail
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 
-SSO_SESSION="${SSO_GUARD_SESSION:-heka}"
-PROFILE="${SSO_GUARD_PROFILE:-code-assist-admin}"
-START_URL="${SSO_GUARD_START_URL:-https://heka.awsapps.com/start}"
 MIN_SECONDS=$(( ${SSO_GUARD_MIN_MINUTES:-45} * 60 ))
+CONFIG="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
 
-newest_expiry() {
+# Emit one "session<TAB>start_url<TAB>first_profile" line per sso-session.
+sessions() {
+    awk '
+        /^\[sso-session /   { sec="s"; name=$2; sub(/\]$/,"",name); next }
+        /^\[profile /       { sec="p"; prof=$2; sub(/\]$/,"",prof); next }
+        /^\[/               { sec=""; next }
+        sec=="s" && $1=="sso_start_url" { url[name]=$3 }
+        sec=="p" && $1=="sso_session"   { if (!(($3) in prof_of)) prof_of[$3]=prof }
+        END { for (n in url) printf "%s\t%s\t%s\n", n, url[n], prof_of[n] }
+    ' "$CONFIG"
+}
+
+expiry_for() { # $1 = start_url -> newest expiresAt epoch (0 if none)
     local best=0 f exp e
     for f in "$HOME"/.aws/sso/cache/*.json; do
         [[ -e "$f" ]] || continue
-        exp=$(jq -r --arg u "$START_URL" 'select(.startUrl == $u) | .expiresAt // empty' "$f" 2>/dev/null) || continue
+        exp=$(jq -r --arg u "$1" 'select(.startUrl == $u) | .expiresAt // empty' "$f" 2>/dev/null) || continue
         [[ -n "$exp" ]] || continue
         e=$(date -d "$exp" +%s 2>/dev/null) || continue
         (( e > best )) && best=$e
@@ -26,19 +39,25 @@ newest_expiry() {
     echo "$best"
 }
 
+rc=0
 now=$(date +%s)
-(( $(newest_expiry) - now > MIN_SECONDS )) && exit 0
+while IFS=$'\t' read -r name url profile; do
+    [[ -n "$profile" ]] || continue # nothing consumes this session
+    (( $(expiry_for "$url") - now > MIN_SECONDS )) && continue
 
-aws sts get-caller-identity --profile "$PROFILE" >/dev/null 2>&1 || true
-if (( $(newest_expiry) - now > MIN_SECONDS )); then
-    echo "sso-guard: access token refreshed silently"
-    exit 0
-fi
+    aws sts get-caller-identity --profile "$profile" >/dev/null 2>&1 || true
+    if (( $(expiry_for "$url") - now > MIN_SECONDS )); then
+        echo "sso-guard: $name access token refreshed silently"
+        continue
+    fi
 
-if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
-    command -v notify-send >/dev/null 2>&1 && \
-        notify-send -u critical "sso-guard" "AWS SSO session expiring — complete the login in the browser"
-    exec aws sso login --sso-session "$SSO_SESSION"
-fi
-echo "sso-guard: needs interactive login (no display): aws sso login --sso-session $SSO_SESSION" >&2
-exit 1
+    if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
+        command -v notify-send >/dev/null 2>&1 && \
+            notify-send -u critical "sso-guard" "AWS SSO session '$name' expiring — complete the login in the browser"
+        aws sso login --sso-session "$name" || rc=1
+    else
+        echo "sso-guard: '$name' needs interactive login (no display): aws sso login --sso-session $name" >&2
+        rc=1
+    fi
+done < <(sessions)
+exit "$rc"
