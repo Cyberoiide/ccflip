@@ -75,6 +75,13 @@ list 100 token_expired
 "$CCFLIP" -p hello 2>/dev/null
 check 'VIA=claude BEDROCK=1' mapped-all-dry
 
+# Mapped + qm dry + sia usage UNKNOWN (null, mid-poll) -> Bedrock, never a
+# blind hand-off to an account whose health cannot be confirmed.
+list 100 ok
+jq '.accounts[0].usage = null' "$LIST_FIXTURE" > "$LIST_FIXTURE.tmp" && mv "$LIST_FIXTURE.tmp" "$LIST_FIXTURE"
+"$CCFLIP" -p hello 2>/dev/null
+check 'VIA=claude BEDROCK=1' mapped-dry-alt-unknown
+
 # Bedrock model override rewrites t3code's explicit --model flag.
 printf 'export CLAUDE_CODE_USE_BEDROCK=1\nexport CCFLIP_BEDROCK_MODEL_OVERRIDE="claude-opus-5[1m]"\n' > "$T/bedrock.env"
 list 100 token_expired

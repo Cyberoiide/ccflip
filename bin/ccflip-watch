@@ -140,11 +140,13 @@ acct_usable() { # $1=list json, $2=email
         | length > 0' <<<"$1" >/dev/null 2>&1
 }
 
+# Selection requires KNOWN-good usage — unknown (null) must not elect an
+# account, only excuse one from being killed (acct_usable stays fail-open).
 has_enabled_usable() { # $1=list json
     jq -e --argjson thr "$THRESHOLD" --argjson sthr "$SPEND_THRESHOLD" '
         [.accounts[] | select((.disabled | not) and .usageStatus == "ok"
-          and ((.usage.fiveHour == null) or ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr))
-          and ((.usage.spend == null) or (.usage.spend.pct < $sthr)))]
+          and (((.usage.fiveHour != null) and ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr))
+               or ((.usage.spend != null) and (.usage.spend.pct < $sthr))))]
         | length > 0' <<<"$1" >/dev/null 2>&1
 }
 

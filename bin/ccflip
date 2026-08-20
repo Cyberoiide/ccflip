@@ -155,9 +155,9 @@ if [[ -n "$mapped_email" ]]; then
     alt=$(jq -r --arg skip "$mapped_email" --argjson thr "$THRESHOLD" --argjson sthr "$SPEND_THRESHOLD" '
         [.accounts[] | select(.email != $skip and (.disabled | not)
                               and .usageStatus == "ok"
-                              and ((.usage.fiveHour == null)
-                                   or ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr))
-                              and ((.usage.spend == null) or (.usage.spend.pct < $sthr)))]
+                              and (((.usage.fiveHour != null)
+                                    and ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr))
+                                   or ((.usage.spend != null) and (.usage.spend.pct < $sthr))))]
         | sort_by(.usage.fiveHour.pct // -1) | first | .email // empty' <<<"$LIST")
     if [[ -n "$alt" ]]; then
         echo "ccflip: $mapped_email exhausted -> $alt" >&2
@@ -175,9 +175,9 @@ if usable ".accounts[] | select(.number == $active)"; then
 fi
 if jq -e --argjson thr "$THRESHOLD" --argjson sthr "$SPEND_THRESHOLD" '
       [.accounts[] | select((.disabled | not) and .usageStatus == "ok"
-                            and ((.usage.fiveHour == null)
-                                 or ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr))
-                            and ((.usage.spend == null) or (.usage.spend.pct < $sthr)))]
+                            and (((.usage.fiveHour != null)
+                                  and ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr))
+                                 or ((.usage.spend != null) and (.usage.spend.pct < $sthr))))]
       | length > 0' <<<"$LIST" >/dev/null; then
     go_subscription -- "$@"
 fi
