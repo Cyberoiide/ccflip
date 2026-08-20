@@ -136,6 +136,12 @@ own `awsAuthRefresh` setting stays as the in-session belt.
 - Enterprise/spend accounts have no readable 5h/7d windows; cswap auto
   fails over off them if they're the default login. Keep the other accounts
   `cswap disable`d if the default must stay put.
+- One OAuth token family cannot live on two hosts: `cswap export`/`import`
+  clones the refresh-token family, and whichever host refreshes first
+  rotates it and kills the other copy (`relogin_required` ping-pong). Give
+  each host its own `/login` + `cswap add` per account; on headless hosts
+  use `claude setup-token` + `cswap add-token` (no rotation). Export/import
+  is bootstrap only.
 - Bedrock model ids come in four forms (in-region `anthropic.X`, geo
   `eu./us./au.`, `global.`) and IAM grants are per inference-profile ARN.
   Use ALIAS forms (`claude-opus-5[1m]`) in bedrock.env and the override —
