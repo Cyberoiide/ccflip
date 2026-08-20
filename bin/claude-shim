@@ -7,7 +7,12 @@
 set -euo pipefail
 REAL="$HOME/.local/bin/claude"
 [[ -x "$REAL" ]] || REAL=/usr/bin/claude
-if [[ -n "${CCFLIP_ROUTED:-}" ]] || ! command -v ccflip >/dev/null 2>&1; then
+# Bypass — the caller already chose: CCFLIP_ROUTED (ccflip descendants),
+# CLAUDE_CONFIG_DIR (explicit `cswap run <account>` session), or
+# CLAUDE_CODE_USE_BEDROCK (explicitly forced Bedrock). Policy routing is
+# only for spawns that expressed no preference.
+if [[ -n "${CCFLIP_ROUTED:-}${CLAUDE_CONFIG_DIR:-}${CLAUDE_CODE_USE_BEDROCK:-}" ]] \
+   || ! command -v ccflip >/dev/null 2>&1; then
     exec "$REAL" "$@"
 fi
 export CCFLIP_ROUTED=1
