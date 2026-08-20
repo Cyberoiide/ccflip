@@ -120,10 +120,103 @@ pick_target() { # $1=current account number  (stdin: cswap list --json)
           else empty end'
 }
 
+# --- mid-session tier switching ---------------------------------------------
+# Creds rotation covers subscription->subscription, but Bedrock needs env vars
+# a live process cannot receive. The conversation is the session id, not the
+# process: SDK harnesses (t3code, claude-mem) respawn a killed process on the
+# next message with the same session. So: a harness-spawned process whose
+# account is exhausted with no rotation target is killed (its requests fail
+# anyway) and revives on Bedrock; a Bedrock process whose subscription tier is
+# usable again is killed once its transcript has been idle, and revives on the
+# account. Terminal-spawned sessions are never touched.
+SWITCHBACK_IDLE="${CCFLIP_SWITCHBACK_IDLE:-300}"
+PROC_MIN_AGE="${CCFLIP_PROC_MIN_AGE:-120}"
+
+acct_usable() { # $1=list json, $2=email
+    jq -e --arg e "$2" --argjson thr "$THRESHOLD" --argjson sthr "$SPEND_THRESHOLD" '
+        [.accounts[] | select(.email == $e and .usageStatus == "ok"
+          and ((.usage.fiveHour == null) or ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr))
+          and ((.usage.spend == null) or (.usage.spend.pct < $sthr)))]
+        | length > 0' <<<"$1" >/dev/null 2>&1
+}
+
+has_enabled_usable() { # $1=list json
+    jq -e --argjson thr "$THRESHOLD" --argjson sthr "$SPEND_THRESHOLD" '
+        [.accounts[] | select((.disabled | not) and .usageStatus == "ok"
+          and ((.usage.fiveHour == null) or ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr))
+          and ((.usage.spend == null) or (.usage.spend.pct < $sthr)))]
+        | length > 0' <<<"$1" >/dev/null 2>&1
+}
+
+mapped_email_for() { # $1=cwd
+    jq -r --arg pwd "$1" '
+        (.mappings // {}) | to_entries
+        | map(.key as $k | select(($k == $pwd) or ($pwd | startswith($k + "/"))))
+        | sort_by(.key | length) | last | .value.email // empty' \
+        "${XDG_DATA_HOME:-$HOME/.local/share}/claude-swap/mappings.json" 2>/dev/null || true
+}
+
+# Would a fresh ccflip launch in this cwd land on a subscription account?
+has_subscription_for() { # $1=list json, $2=cwd
+    local m; m=$(mapped_email_for "$2")
+    if [[ -n "$m" ]] && acct_usable "$1" "$m"; then return 0; fi
+    has_enabled_usable "$1"
+}
+
+transcript_idle() { # $1=config dir ("" = default profile), $2=cwd
+    local base="${1:-$HOME/.claude}" slug
+    slug=$(sed 's/[/.]/-/g' <<<"$2")
+    [[ -z "$(find "$base/projects/$slug" -name '*.jsonl' \
+             -mmin -$(( SWITCHBACK_IDLE / 60 )) 2>/dev/null | head -1)" ]]
+}
+
+switch_tick() { # $1=list json
+    local p pid exe envs cfg cwd num email ppid pcomm now
+    now=$(date +%s)
+    for p in /proc/[0-9]*; do
+        exe=$(readlink "$p/exe" 2>/dev/null) || continue
+        [[ "$exe" == */claude/versions/* || "${exe##*/}" == claude ]] || continue
+        pid="${p#/proc/}"
+        # Only harness-spawned processes auto-respawn; never kill terminals.
+        ppid=$(awk '/^PPid:/{print $2}' "$p/status" 2>/dev/null) || continue
+        pcomm=$(cat "/proc/$ppid/comm" 2>/dev/null) || continue
+        case "$pcomm" in node*|bun*|t3code*|electron*) ;; *) continue ;; esac
+        (( now - $(stat -c %Y "$p" 2>/dev/null || echo "$now") < PROC_MIN_AGE )) && continue
+        cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
+        [[ "$cwd" == *claude-mem* ]] && continue
+        envs=$(tr '\0' '\n' < "$p/environ" 2>/dev/null) || continue
+
+        if grep -q '^CLAUDE_CODE_USE_BEDROCK=' <<<"$envs"; then
+            # Bedrock session: move back once a subscription tier is usable.
+            if has_subscription_for "$1" "$cwd" && transcript_idle "" "$cwd"; then
+                kill "$pid" 2>/dev/null && \
+                    log "switchback: ended bedrock process $pid ($cwd) — subscription usable again, session revives on it"
+            fi
+            continue
+        fi
+
+        cfg=$(grep -m1 '^CLAUDE_CONFIG_DIR=' <<<"$envs" | cut -d= -f2- || true)
+        if [[ -n "$cfg" ]]; then
+            num=$(basename "$cfg"); num="${num%%-*}"
+            [[ "$num" =~ ^[0-9]+$ ]] || continue
+            email=$(jq -r --argjson n "$num" '.accounts[] | select(.number == $n) | .email' <<<"$1")
+            acct_usable "$1" "$email" && continue
+            [[ -n "$(pick_target "$num" <<<"$1")" ]] && continue # creds rotation covers it
+        else
+            email=$(jq -r '[.accounts[] | select(.active == true) | .email] | first // empty' <<<"$1")
+            acct_usable "$1" "$email" && continue
+            has_enabled_usable "$1" && continue # rotation/launcher covers it
+        fi
+        kill "$pid" 2>/dev/null && \
+            log "failover: ended process $pid on exhausted ${email:-?} ($cwd) — session revives on Bedrock"
+    done
+}
+
 tick() {
     local list dir name num target
     list=$(cswap list --json 2>/dev/null) || return 0
     spend_alert <<<"$list"
+    switch_tick "$list"
     [[ -d "$SESSIONS_DIR" ]] || return 0
     for dir in "$SESSIONS_DIR"/*/; do
         [[ -d "$dir" ]] || continue
