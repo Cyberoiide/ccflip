@@ -1,9 +1,9 @@
 [Unit]
-Description=Check AWS SSO freshness every 15 minutes
+Description=AWS SSO freshness backstop (sso-guard re-arms itself adaptively)
 
 [Timer]
 OnStartupSec=2min
-OnCalendar=*:00/15
+OnCalendar=hourly
 Persistent=true
 
 [Install]

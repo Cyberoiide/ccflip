@@ -8,7 +8,11 @@
 # When one runs low, a plain STS call lets botocore mint a fresh token from
 # the SSO refresh token — no browser. Only when the refresh token itself is
 # dead does it open the browser login (one click against a live IdP session),
-# and only on a graphical session. Run from a systemd user timer.
+# and only on a graphical session.
+#
+# Scheduling is adaptive: each run arms a transient timer to wake ~1 min
+# before the earliest token crosses the threshold. The static hourly timer
+# is only the reboot-safe backstop.
 set -euo pipefail
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 
@@ -41,23 +45,55 @@ expiry_for() { # $1 = start_url -> newest expiresAt epoch (0 if none)
 
 rc=0
 now=$(date +%s)
+min_exp=0
+track() { if (( $1 > 0 )) && (( min_exp == 0 || $1 < min_exp )); then min_exp=$1; fi; }
+
 while IFS=$'\t' read -r name url profile; do
     [[ -n "$profile" ]] || continue # nothing consumes this session
-    (( $(expiry_for "$url") - now > MIN_SECONDS )) && continue
+    e=$(expiry_for "$url")
+    if (( e - now > MIN_SECONDS )); then track "$e"; continue; fi
 
+    # Access token low: botocore mints a fresh one from the SSO refresh
+    # token if the IdC session still lives — a plain STS call triggers it.
     aws sts get-caller-identity --profile "$profile" >/dev/null 2>&1 || true
-    if (( $(expiry_for "$url") - now > MIN_SECONDS )); then
+    e=$(expiry_for "$url")
+    if (( e - now > MIN_SECONDS )); then
         echo "sso-guard: $name access token refreshed silently"
-        continue
+        track "$e"; continue
     fi
 
     if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
         command -v notify-send >/dev/null 2>&1 && \
             notify-send -u critical "sso-guard" "AWS SSO session '$name' expiring — complete the login in the browser"
-        aws sso login --sso-session "$name" || rc=1
+        if aws sso login --sso-session "$name"; then
+            track "$(expiry_for "$url")"
+        else
+            rc=1
+        fi
     else
         echo "sso-guard: '$name' needs interactive login (no display): aws sso login --sso-session $name" >&2
         rc=1
     fi
 done < <(sessions)
+
+# Adaptive re-arm: wake ~1 min before the earliest token dips under the
+# threshold. Failure retries in 10 min; no data falls back to the hourly
+# backstop timer. Clamped to [5 min, 6 h].
+if command -v systemd-run >/dev/null 2>&1; then
+    if (( rc != 0 )); then
+        delay=600
+    elif (( min_exp > 0 )); then
+        delay=$(( min_exp - $(date +%s) - MIN_SECONDS - 60 ))
+        if (( delay < 300 )); then delay=300; fi
+        if (( delay > 21600 )); then delay=21600; fi
+    else
+        delay=0
+    fi
+    if (( delay > 0 )); then
+        systemctl --user stop sso-guard-next.timer >/dev/null 2>&1 || true
+        systemd-run --user --quiet --collect --unit sso-guard-next \
+            --on-active="${delay}s" systemctl --user start sso-guard.service \
+            && echo "sso-guard: next check in $(( delay / 60 )) min"
+    fi
+fi
 exit "$rc"
