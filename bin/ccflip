@@ -116,6 +116,14 @@ go_bedrock() { # $1 = reason, rest = claude args
     local reason=$1; shift
     if [[ -f "$BEDROCK_ENV" ]]; then
         echo "ccflip: $reason -> Bedrock" >&2
+        # A mapped dir's conversation history lives in its pinned profile —
+        # keep that profile so sessions resume across tiers (Bedrock SigV4
+        # auth ignores the profile's subscription credentials).
+        if [[ -n "${mapped_email:-}" ]]; then
+            local prof
+            prof=$(printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/claude-swap/sessions/"*"-${mapped_email/@/_}" | head -1)
+            [[ -d "$prof" ]] && export CLAUDE_CONFIG_DIR="$prof"
+        fi
         # shellcheck source=/dev/null
         . "$BEDROCK_ENV"
         # An explicit --model flag (t3code always sends one) beats every env
