@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# claude-shim — interpose `claude` for spawners whose settings can't reach
+# ccflip (t3code's remote server ignores the desktop app's binaryPath).
+# Install it as `claude` in a directory that precedes the real binary in the
+# spawner's PATH. First hit routes through ccflip; CCFLIP_ROUTED marks
+# descendants so ccflip/cswap re-resolving `claude` get the real binary.
+set -euo pipefail
+REAL="$HOME/.local/bin/claude"
+[[ -x "$REAL" ]] || REAL=/usr/bin/claude
+if [[ -n "${CCFLIP_ROUTED:-}" ]] || ! command -v ccflip >/dev/null 2>&1; then
+    exec "$REAL" "$@"
+fi
+export CCFLIP_ROUTED=1
+exec ccflip "$@"
