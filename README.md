@@ -118,6 +118,15 @@ cswap polls it but never acts on it. ccflip does, at two lines:
 
 Set either in the environment or in `policy.env`.
 
+## SSO freshness (hosts using an AWS profile)
+
+`sso-guard` + its timer keep the SSO session alive so the Bedrock tier never
+dies with "Token is expired": every 15 min it silently renews the access
+token via the SSO refresh token when under `SSO_GUARD_MIN_MINUTES` (45)
+left, and opens the one-click browser login only when the Identity Center
+session itself has died. Not needed on instance-role hosts. Claude Code's
+own `awsAuthRefresh` setting stays as the in-session belt.
+
 ## Gotchas
 
 - Never run `cswap run` from a shell still carrying `CLAUDE_CODE_USE_BEDROCK=1`:

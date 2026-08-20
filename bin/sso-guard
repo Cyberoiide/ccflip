@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# sso-guard — keep the AWS SSO session fresh so Bedrock sessions (and the
+# litellm gateway) never die mid-flight with "Token is expired".
+#
+# Silent while the access token has life. When it runs low, a plain STS call
+# lets botocore mint a fresh one from the SSO refresh token — no browser.
+# Only when the refresh token itself is dead does it open the browser login,
+# and only on a graphical session. Run from a systemd user timer.
+set -euo pipefail
+export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+
+SSO_SESSION="${SSO_GUARD_SESSION:-heka}"
+PROFILE="${SSO_GUARD_PROFILE:-code-assist-admin}"
+START_URL="${SSO_GUARD_START_URL:-https://heka.awsapps.com/start}"
+MIN_SECONDS=$(( ${SSO_GUARD_MIN_MINUTES:-45} * 60 ))
+
+newest_expiry() {
+    local best=0 f exp e
+    for f in "$HOME"/.aws/sso/cache/*.json; do
+        [[ -e "$f" ]] || continue
+        exp=$(jq -r --arg u "$START_URL" 'select(.startUrl == $u) | .expiresAt // empty' "$f" 2>/dev/null) || continue
+        [[ -n "$exp" ]] || continue
+        e=$(date -d "$exp" +%s 2>/dev/null) || continue
+        (( e > best )) && best=$e
+    done
+    echo "$best"
+}
+
+now=$(date +%s)
+(( $(newest_expiry) - now > MIN_SECONDS )) && exit 0
+
+aws sts get-caller-identity --profile "$PROFILE" >/dev/null 2>&1 || true
+if (( $(newest_expiry) - now > MIN_SECONDS )); then
+    echo "sso-guard: access token refreshed silently"
+    exit 0
+fi
+
+if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
+    command -v notify-send >/dev/null 2>&1 && \
+        notify-send -u critical "sso-guard" "AWS SSO session expiring — complete the login in the browser"
+    exec aws sso login --sso-session "$SSO_SESSION"
+fi
+echo "sso-guard: needs interactive login (no display): aws sso login --sso-session $SSO_SESSION" >&2
+exit 1

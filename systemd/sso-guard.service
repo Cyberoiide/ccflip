@@ -1,0 +1,6 @@
+[Unit]
+Description=Keep the AWS SSO session fresh for Bedrock
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/sso-guard
