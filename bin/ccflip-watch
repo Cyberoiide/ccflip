@@ -171,16 +171,22 @@ transcript_idle() { # $1=config dir ("" = default profile), $2=cwd
 }
 
 switch_tick() { # $1=list json
-    local p pid exe envs cfg cwd num email ppid pcomm now
+    local p pid exe envs cfg cwd num email ppid pcomm pexe now
     now=$(date +%s)
     for p in /proc/[0-9]*; do
         exe=$(readlink "$p/exe" 2>/dev/null) || continue
         [[ "$exe" == */claude/versions/* || "${exe##*/}" == claude ]] || continue
         pid="${p#/proc/}"
         # Only harness-spawned processes auto-respawn; never kill terminals.
+        # Node renames its main thread ("MainThread"), so match the parent's
+        # exe first and fall back to comm.
         ppid=$(awk '/^PPid:/{print $2}' "$p/status" 2>/dev/null) || continue
-        pcomm=$(cat "/proc/$ppid/comm" 2>/dev/null) || continue
-        case "$pcomm" in node*|bun*|t3code*|electron*) ;; *) continue ;; esac
+        pexe=$(readlink "/proc/$ppid/exe" 2>/dev/null || true)
+        pcomm=$(cat "/proc/$ppid/comm" 2>/dev/null || true)
+        case "${pexe##*/}:$pcomm" in
+            *node*|*bun*|*t3code*|*electron*) ;;
+            *) continue ;;
+        esac
         (( now - $(stat -c %Y "$p" 2>/dev/null || echo "$now") < PROC_MIN_AGE )) && continue
         cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
         [[ "$cwd" == *claude-mem* ]] && continue
