@@ -27,6 +27,51 @@ if [[ "${1:-}" == "bedrock" ]]; then
     exec claude "$@" # shim bypasses on CLAUDE_CODE_USE_BEDROCK
 fi
 
+# Priced sum of this month's Bedrock-served messages, incremental per file.
+bedrock_month_cost() {
+    local month cache dir manifest plan f cost updates=""
+    month=$(date +%Y-%m); dir="$HOME/.cache/ccflip"
+    cache="$dir/bedrock-cost-$month.json"
+    mkdir -p "$dir"; find "$dir" -name 'bedrock-cost-*' ! -name "*$month*" -delete 2>/dev/null
+    [[ -s "$cache" ]] || echo '{}' > "$cache"
+    manifest=$(find "$HOME/.claude/projects" \
+                    "${XDG_DATA_HOME:-$HOME/.local/share}/claude-swap/sessions" \
+                    -name '*.jsonl' -newermt "$month-01" -printf '%p\t%T@\t%s\n' 2>/dev/null)
+    plan=$(jq -Rrs --slurpfile c "$cache" '
+        ($c[0]) as $cache
+        | [split("\n")[] | select(length > 0) | split("\t")] as $files
+        | ([$files[] | . as $r | $cache[$r[0]] | select(. != null and .m == $r[1] and .s == $r[2]) | .c] | add // 0) as $hit
+        | ([$files[] | . as $r | select(($cache[$r[0]] | . == null or .m != $r[1] or .s != $r[2]))] ) as $miss
+        | ([$hit | tostring] + [$miss[] | @tsv]) | .[]' <<<"$manifest")
+    local hit_sum; hit_sum=$(head -1 <<<"$plan")
+    while IFS=$'\t' read -r f m sz; do
+        [[ -n "$f" ]] || continue
+        cost=$(jq -Rrs '
+            def rates: {"claude-fable-5":[10,50], "claude-mythos-5":[10,50],
+                        "claude-opus-5":[5,25], "claude-opus-4-8":[5,25], "claude-opus-4-7":[5,25],
+                        "claude-sonnet-5":[3,15], "claude-sonnet-4-6":[3,15], "claude-haiku-4-5":[1,5]};
+            [ split("\n")[] | fromjson?
+              | select(.message.id? // "" | startswith("msg_bdrk_"))
+              | .message as $msg
+              | (rates[($msg.model // "" | sub("\\[1m\\]$"; ""))] // [5,25]) as $r
+              | ($msg.usage // {})
+              | ((.input_tokens // 0) * $r[0]
+                 + (.cache_creation_input_tokens // 0) * $r[0] * 1.25
+                 + (.cache_read_input_tokens // 0) * $r[0] * 0.1
+                 + (.output_tokens // 0) * $r[1]) / 1e6 ] | add // 0' "$f" 2>/dev/null) || cost=0
+        updates+="$f\t$m\t$sz\t$cost\n"
+        hit_sum=$(awk -v a="$hit_sum" -v b="$cost" 'BEGIN {printf "%.6f", a + b}')
+    done < <(tail -n +2 <<<"$plan")
+    if [[ -n "$updates" ]]; then
+        printf '%b' "$updates" | jq -Rrs --slurpfile c "$cache" '
+            ($c[0]) as $cache
+            | [split("\n")[] | select(length > 0) | split("\t")]
+            | reduce .[] as $r ($cache; .[$r[0]] = {m: $r[1], s: $r[2], c: ($r[3] | tonumber)})' \
+            > "$cache.tmp" && mv "$cache.tmp" "$cache"
+    fi
+    awk -v t="$hit_sum" 'BEGIN {printf "bedrock (you, this host)\t≈ $%.2f\tAPI-rate est.\tmonth-to-date\n", t}'
+}
+
 # `ccflip budget` — the default account's REAL dollar meters. cswap only
 # parses extra_usage (the overflow budget); the seat's included monthly pool
 # arrives under an internal codename with limit_dollars — print any such
@@ -46,21 +91,11 @@ if [[ "${1:-}" == "budget" ]]; then
             echo "oauth: no token in default profile"
         fi
         # Bedrock tier: YOUR consumption only — the AWS account is shared and
-        # Cost Explorer cannot split by IAM principal, so sum this machine's
-        # transcripts instead. Bedrock-served messages carry msg_bdrk_ ids.
-        # Tokens, not dollars — no invented pricing table.
-        find "$HOME/.claude/projects" \
-             "${XDG_DATA_HOME:-$HOME/.local/share}/claude-swap/sessions" \
-             -name '*.jsonl' -newermt "$(date +%Y-%m-01)" 2>/dev/null \
-        | xargs -r cat 2>/dev/null \
-        | jq -Rr 'fromjson? | select(.message.id? // "" | startswith("msg_bdrk_"))
-                  | .message.usage // empty
-                  | [(.output_tokens // 0),
-                     (.input_tokens // 0) + (.cache_creation_input_tokens // 0)
-                       + (.cache_read_input_tokens // 0)] | @tsv' 2>/dev/null \
-        | awk -F'\t' '{o+=$1; i+=$2; n++} END {
-              printf "bedrock (you, this host)\t%.2fM out / %.0fM in+cache\t%d msgs\tmonth-to-date\n",
-                     o/1e6, i/1e6, n}'
+        # Cost Explorer cannot split by IAM principal, so price this machine's
+        # transcripts (msg_bdrk_ ids) at API rates (rates verified against
+        # real receipts; cache write x1.25, cache read x0.1). Costs are cached
+        # per file by mtime+size — only changed files get re-parsed.
+        bedrock_month_cost
     } | column -t -s $'\t'
     exit 0
 fi
