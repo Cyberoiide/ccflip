@@ -25,6 +25,7 @@ EOF
 chmod +x "$T/claude" "$T/cswap"
 export PATH="$T:$PATH" OUT="$T/out" CCFLIP_BEDROCK_ENV="$T/bedrock.env"
 export LIST_FIXTURE="$T/list.json" CCFLIP_MAPPINGS="$T/mappings.json"
+export CCFLIP_LIMIT_FLAGS="$T/limit-flags.json"
 printf 'export CLAUDE_CODE_USE_BEDROCK=1\n' > "$T/bedrock.env"
 
 # Fixture: 1=sia (spend-only, no windows), 2=qm (windowed, disabled, mapped).
@@ -87,6 +88,19 @@ printf 'export CLAUDE_CODE_USE_BEDROCK=1\nexport CCFLIP_BEDROCK_MODEL_OVERRIDE="
 list 100 token_expired
 "$CCFLIP" --model 'claude-fable-5[1m]' -p hello 2>/dev/null
 check 'ARGS=--model claude-opus-5[1m] -p hello' model-override
+
+# Mapped + qm healthy per cswap BUT freshly limit-flagged (transcript error
+# beat the usage poll) -> alternate account immediately, no stale-cache lag.
+list 5 ok
+echo "{\"qm@x.com\": $(( $(date +%s) + 600 ))}" > "$CCFLIP_LIMIT_FLAGS"
+"$CCFLIP" -p hello 2>/dev/null
+check 'VIA=cswap-run ACCT=sia@x.com BEDROCK=unset' mapped-flagged-alt
+
+# Both flagged -> Bedrock even though cswap still says usable.
+echo "{\"qm@x.com\": $(( $(date +%s) + 600 )), \"sia@x.com\": $(( $(date +%s) + 600 ))}" > "$CCFLIP_LIMIT_FLAGS"
+"$CCFLIP" -p hello 2>/dev/null
+check 'VIA=claude BEDROCK=1' mapped-all-flagged
+rm "$CCFLIP_LIMIT_FLAGS"
 
 # Mapped + everything dry + no bedrock.env -> still launches.
 rm "$T/bedrock.env"

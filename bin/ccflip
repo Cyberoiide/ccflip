@@ -127,6 +127,15 @@ THRESHOLD="${CCFLIP_THRESHOLD:-99}" # launcher acts only on truly-dry windows
 # Spend-based accounts (enterprise budget) count as dry near their cap, so
 # routing falls to the next tier before requests start failing.
 SPEND_THRESHOLD="${CCFLIP_SPEND_THRESHOLD:-97}"
+# Accounts that just errored with a limit in a live transcript get flagged by
+# ccflip-watch (limit-flags.json: email -> epoch expiry). The flag beats
+# cswap's polled usage, which lags minutes behind a freshly hit limit.
+LIMIT_FLAGS="${CCFLIP_LIMIT_FLAGS:-$HOME/.local/state/ccflip/limit-flags.json}"
+flagged() { # $1 = email
+    [[ -s "$LIMIT_FLAGS" ]] || return 1
+    jq -e --arg e "$1" --argjson now "$(date +%s)" \
+       '(.[$e] // 0) > $now' "$LIMIT_FLAGS" >/dev/null 2>&1
+}
 
 command -v cswap >/dev/null 2>&1 || exec claude "$@"
 LIST=$(cswap list --json 2>/dev/null) || exec claude "$@"
@@ -192,7 +201,7 @@ mapped_email=$(jq -r --arg pwd "$PWD" '
     "$MAPPINGS" 2>/dev/null || true)
 
 if [[ -n "$mapped_email" ]]; then
-    if usable ".accounts[] | select(.email == \"$mapped_email\")"; then
+    if usable ".accounts[] | select(.email == \"$mapped_email\")" && ! flagged "$mapped_email"; then
         go_subscription -- "$@" # bare run resolves the mapping itself
     fi
     # Pinned account is dry: any other enabled usable account may serve this
@@ -204,6 +213,7 @@ if [[ -n "$mapped_email" ]]; then
                                     and ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr))
                                    or ((.usage.spend != null) and (.usage.spend.pct < $sthr))))]
         | sort_by(.usage.fiveHour.pct // -1) | first | .email // empty' <<<"$LIST")
+    if [[ -n "$alt" ]] && flagged "$alt"; then alt=""; fi
     if [[ -n "$alt" ]]; then
         echo "ccflip: $mapped_email exhausted -> $alt" >&2
         go_subscription "$alt" -- "$@"
@@ -215,15 +225,22 @@ fi
 # account could replace it, launch anyway — the cswap-auto daemon moves the
 # default login, not us.
 active=$(jq -r '.activeAccountNumber' <<<"$LIST")
-if usable ".accounts[] | select(.number == $active)"; then
+active_email=$(jq -r --argjson n "$active" '.accounts[] | select(.number == $n) | .email // empty' <<<"$LIST")
+if usable ".accounts[] | select(.number == $active)" && ! flagged "$active_email"; then
     go_subscription -- "$@"
 fi
-if jq -e --argjson thr "$THRESHOLD" --argjson sthr "$SPEND_THRESHOLD" '
-      [.accounts[] | select((.disabled | not) and .usageStatus == "ok"
-                            and (((.usage.fiveHour != null)
-                                  and ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr))
-                                 or ((.usage.spend != null) and (.usage.spend.pct < $sthr))))]
-      | length > 0' <<<"$LIST" >/dev/null; then
+any_unflagged_usable() {
+    local e
+    while IFS= read -r e; do
+        flagged "$e" || return 0
+    done < <(jq -r --argjson thr "$THRESHOLD" --argjson sthr "$SPEND_THRESHOLD" '
+        .accounts[] | select((.disabled | not) and .usageStatus == "ok"
+              and (((.usage.fiveHour != null)
+                    and ([.usage.fiveHour.pct, .usage.sevenDay.pct] | max < $thr))
+                   or ((.usage.spend != null) and (.usage.spend.pct < $sthr)))) | .email' <<<"$LIST")
+    return 1
+}
+if any_unflagged_usable; then
     go_subscription -- "$@"
 fi
 go_bedrock "no usable subscription account" "$@"
