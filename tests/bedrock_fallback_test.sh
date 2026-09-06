@@ -89,6 +89,17 @@ list 100 token_expired
 "$CCFLIP" --model 'claude-fable-5[1m]' -p hello 2>/dev/null
 check 'ARGS=--model claude-opus-5[1m] -p hello' model-override
 
+# Mapped + qm on a setup-token (usageStatus "unavailable", no usage data) ->
+# still serves its own pinned dir; a limit flag is what takes it out.
+list 5 ok
+jq '.accounts[1] |= (.usageStatus = "unavailable" | .usage = null)' "$LIST_FIXTURE" > "$LIST_FIXTURE.t" && mv "$LIST_FIXTURE.t" "$LIST_FIXTURE"
+"$CCFLIP" -p hello 2>/dev/null
+check 'VIA=cswap-run ACCT=default BEDROCK=unset' mapped-token-unavailable
+echo "{\"qm@x.com\": $(( $(date +%s) + 600 ))}" > "$CCFLIP_LIMIT_FLAGS"
+"$CCFLIP" -p hello 2>/dev/null
+check 'VIA=cswap-run ACCT=sia@x.com BEDROCK=unset' mapped-token-flagged
+rm "$CCFLIP_LIMIT_FLAGS"
+
 # Mapped + qm healthy per cswap BUT freshly limit-flagged (transcript error
 # beat the usage poll) -> alternate account immediately, no stale-cache lag.
 list 5 ok

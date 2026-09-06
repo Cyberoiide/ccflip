@@ -149,6 +149,17 @@ usable() { # $1 = jq selector for one account row
        <<<"$LIST" >/dev/null 2>&1
 }
 
+# A setup-token account cannot read the usage API (usageStatus "unavailable")
+# yet works fine for requests. Its OWN mapped dir may use it — exhaustion is
+# caught within a tick by the transcript limit-flags. It is still never
+# ELECTED as an alternate for other dirs (selection stays fail-closed).
+pinned_ok() { # $1 = email
+    usable ".accounts[] | select(.email == \"$1\")" && return 0
+    jq -e --arg e "$1" '.accounts[]
+        | select(.email == $e and .usageStatus == "unavailable")' \
+       <<<"$LIST" >/dev/null 2>&1
+}
+
 go_subscription() { # $@ = cswap run args
     # A stale Bedrock env (shell that sourced bedrock.env, process started
     # under old always-on settings) must not leak through — cswap scrubs
@@ -201,7 +212,7 @@ mapped_email=$(jq -r --arg pwd "$PWD" '
     "$MAPPINGS" 2>/dev/null || true)
 
 if [[ -n "$mapped_email" ]]; then
-    if usable ".accounts[] | select(.email == \"$mapped_email\")" && ! flagged "$mapped_email"; then
+    if pinned_ok "$mapped_email" && ! flagged "$mapped_email"; then
         go_subscription -- "$@" # bare run resolves the mapping itself
     fi
     # Pinned account is dry: any other enabled usable account may serve this
