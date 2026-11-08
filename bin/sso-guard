@@ -16,6 +16,13 @@
 set -euo pipefail
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 
+# sso-off disables the backstop timer; a run already in flight (or a stale
+# sso-guard-next) must then do nothing and not re-arm itself.
+if ! systemctl --user is-enabled --quiet sso-guard.timer 2>/dev/null; then
+    echo "sso-guard: disabled (sso-off), skipping"
+    exit 0
+fi
+
 MIN_SECONDS=$(( ${SSO_GUARD_MIN_MINUTES:-45} * 60 ))
 CONFIG="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
 
