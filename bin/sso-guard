@@ -82,7 +82,9 @@ track() { want $(( $1 - MIN_SECONDS - 60 )); }
 while IFS=$'\t' read -r name url profile; do
     [[ -n "$profile" ]] || continue # nothing consumes this session
     e=$(expiry_for "$url")
-    if (( e - now > MIN_SECONDS )); then track "$e"; continue; fi
+    # +90s slack: the re-arm wakes 60s before the threshold, so act now
+    # instead of sleeping 1 more minute and waking again.
+    if (( e - now > MIN_SECONDS + 90 )); then track "$e"; continue; fi
 
     # Access token low: mint a fresh one from the refresh token (no browser)
     # while the IdC session still lives.
