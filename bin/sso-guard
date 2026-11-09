@@ -127,7 +127,7 @@ if command -v systemd-run >/dev/null 2>&1; then
     fi
     if (( delay > 0 )); then
         systemctl --user stop sso-guard-next.timer >/dev/null 2>&1 || true
-        systemd-run --user --quiet --collect --unit sso-guard-next \
+        systemd-run --user --quiet --collect --unit sso-guard-next --timer-property=AccuracySec=1s \
             --on-active="${delay}s" systemctl --user start --no-block sso-guard.service \
             && echo "sso-guard: next check in $(( delay / 60 )) min"
     fi
