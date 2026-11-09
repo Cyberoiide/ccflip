@@ -65,6 +65,41 @@ refresh_silently() { # $1 = start_url -> 0 if refreshed
     return 1
 }
 
+# Is anything running against this sso-session right now? Scans our own
+# processes for `--profile P` / `--profile=P` in argv or AWS_PROFILE=P in
+# the start-up env, for every profile P bound to the session. Prints the
+# first hit ("pid cmd"). Only consulted when a re-login is due, so cheap.
+in_use() { # $1 = session name -> 0 + "pid cmd" if used
+    local profs pid env p i
+    local -a argv
+    profs=" $(awk -v s="$1" '/^\[profile /{p=$2; sub(/\]$/,"",p)} $1=="sso_session" && $3==s {printf "%s ", p}' "$CONFIG")"
+    [[ -n "${profs// /}" ]] || return 1
+    for pid in /proc/[0-9]*; do
+        pid=${pid#/proc/}
+        [[ -O /proc/$pid && $pid != "$$" ]] || continue
+        # Whole argv elements, not a substring: a shell whose -c script merely
+        # mentions a profile must not count as using it.
+        mapfile -d '' argv 2>/dev/null </proc/$pid/cmdline || continue
+        p=""
+        for (( i = 0; i < ${#argv[@]}; i++ )); do
+            case ${argv[i]} in
+                --profile) p=${argv[i+1]:-} ;;
+                --profile=*) p=${argv[i]#--profile=} ;;
+                *) continue ;;
+            esac
+            [[ -n "$p" && "$profs" == *" $p "* ]] && break
+            p=""
+        done
+        if [[ -z "$p" ]]; then
+            env=$( { tr '\0' '\n' </proc/$pid/environ; } 2>/dev/null | grep -m1 '^AWS_PROFILE=') || true
+            p=${env#AWS_PROFILE=}
+            [[ -n "$p" && "$profs" == *" $p "* ]] || continue
+        fi
+        echo "$pid ${argv[*]:0:6}"; return 0
+    done
+    return 1
+}
+
 expiry_for() { # $1 = start_url -> newest expiresAt epoch (0 if none)
     local best=0 f exp e
     for f in "$HOME"/.aws/sso/cache/*.json; do
@@ -106,9 +141,15 @@ while IFS=$'\t' read -r name url profile; do
         want $(( e + 30 )); continue
     fi
 
+    # Sessions outside the allowlist re-login only while something actually
+    # uses them (re-login is click-free while the browser IdP session lives).
     if [[ "$BROWSER_SESSIONS" != "*" && " $BROWSER_SESSIONS " != *" $name "* ]]; then
-        echo "sso-guard: $name expired; silent-only, log in on demand: aws sso login --sso-session $name"
-        continue
+        if hit=$(in_use "$name"); then
+            echo "sso-guard: $name in use (pid $hit), re-login"
+        else
+            echo "sso-guard: $name expired, unused, letting it lapse (aws sso login --sso-session $name)"
+            continue
+        fi
     fi
 
     if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
