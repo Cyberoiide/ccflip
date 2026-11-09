@@ -24,6 +24,11 @@ if ! systemctl --user is-enabled --quiet sso-guard.timer 2>/dev/null; then
 fi
 
 MIN_SECONDS=$(( ${SSO_GUARD_MIN_MINUTES:-15} * 60 ))
+# Sessions allowed to open a browser login when their IdC session ends
+# (space-separated; "*" = all). Others are only kept alive silently: an
+# org that caps sessions at 1h would otherwise mean a consent click per hour
+# for a session nothing autonomous needs. Log in to those on demand.
+BROWSER_SESSIONS="${SSO_GUARD_BROWSER:-*}"
 CONFIG="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
 
 # Emit one "session<TAB>start_url<TAB>first_profile" line per sso-session.
@@ -99,6 +104,11 @@ while IFS=$'\t' read -r name url profile; do
         # so it buys nothing; just come back right after it ends.
         echo "sso-guard: $name session ends $(date -d "@$e" +%H:%M), login then"
         want $(( e + 30 )); continue
+    fi
+
+    if [[ "$BROWSER_SESSIONS" != "*" && " $BROWSER_SESSIONS " != *" $name "* ]]; then
+        echo "sso-guard: $name expired; silent-only, log in on demand: aws sso login --sso-session $name"
+        continue
     fi
 
     if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
