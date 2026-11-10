@@ -100,6 +100,27 @@ in_use() { # $1 = session name -> 0 + "pid cmd" if used
     return 1
 }
 
+# Recent use: every real use of a profile mints role creds into the CLI
+# cache, tagged with the account id, at least hourly while use continues
+# (role creds live 1h). sso-guard itself never mints any. Catches pollers
+# whose own argv/env carry no profile (only their short-lived children do).
+used_recently() { # $1 = session name -> 0 + "acct ... minted HH:MM" if used
+    local accts f a
+    accts=" $(awk -v s="$1" 'function flush() { if (sess && acct) printf "%s ", acct; sess = 0; acct = "" }
+        /^\[/ { flush(); inp = ($0 ~ /^\[profile /); next }
+        inp && $1 == "sso_account_id" { acct = $3 }
+        inp && $1 == "sso_session" && $3 == s { sess = 1 }
+        END { flush() }' "$CONFIG")"
+    [[ -n "${accts// /}" ]] || return 1
+    while IFS= read -r f; do
+        a=$(jq -r '.Credentials.AccountId // empty' "$f" 2>/dev/null) || continue
+        if [[ -n "$a" && "$accts" == *" $a "* ]]; then
+            echo "acct $a creds minted $(date -r "$f" +%H:%M)"; return 0
+        fi
+    done < <(find "$HOME/.aws/cli/cache" -maxdepth 1 -name '*.json' -mmin -65 2>/dev/null)
+    return 1
+}
+
 expiry_for() { # $1 = start_url -> newest expiresAt epoch (0 if none)
     local best=0 f exp e
     for f in "$HOME"/.aws/sso/cache/*.json; do
@@ -126,30 +147,39 @@ while IFS=$'\t' read -r name url profile; do
     # instead of sleeping 1 more minute and waking again.
     if (( e - now > MIN_SECONDS + 90 )); then track "$e"; continue; fi
 
+    # Sessions outside the allowlist are only worth keeping while something
+    # uses them. Decide before spending a refresh call on a dead one.
+    gated=0 why=""
+    if [[ "$BROWSER_SESSIONS" != "*" && " $BROWSER_SESSIONS " != *" $name "* ]]; then
+        gated=1
+        why=$(in_use "$name") || why=$(used_recently "$name") || why=""
+        if [[ -z "$why" ]] && (( e <= now )); then
+            echo "sso-guard: $name expired, unused, letting it lapse (aws sso login --sso-session $name)"
+            continue
+        fi
+    fi
+
     # Access token low: mint a fresh one from the refresh token (no browser)
     # while the IdC session still lives.
     if refresh_silently "$url"; then
         e=$(expiry_for "$url")
-        if (( e - now > MIN_SECONDS )); then
+        # A full refresh buys ~60 min. Less means the IdC session itself
+        # ends at $e: further refreshes or a browser login before then reuse
+        # that same session and buy nothing, so sleep until it ends.
+        if (( e - now > 3000 )); then
             echo "sso-guard: $name access token refreshed silently"
             track "$e"; continue
         fi
-        # Refresh worked but came back short: the IdC session itself ends at
-        # $e. A browser login now would reuse that same session (same end),
-        # so it buys nothing; just come back right after it ends.
         echo "sso-guard: $name session ends $(date -d "@$e" +%H:%M), login then"
         want $(( e + 30 )); continue
     fi
 
-    # Sessions outside the allowlist re-login only while something actually
-    # uses them (re-login is click-free while the browser IdP session lives).
-    if [[ "$BROWSER_SESSIONS" != "*" && " $BROWSER_SESSIONS " != *" $name "* ]]; then
-        if hit=$(in_use "$name"); then
-            echo "sso-guard: $name in use (pid $hit), re-login"
-        else
-            echo "sso-guard: $name expired, unused, letting it lapse (aws sso login --sso-session $name)"
+    if (( gated )); then
+        if [[ -z "$why" ]]; then
+            echo "sso-guard: $name session over, unused, letting it lapse (aws sso login --sso-session $name)"
             continue
         fi
+        echo "sso-guard: $name in use ($why), re-login"
     fi
 
     if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
