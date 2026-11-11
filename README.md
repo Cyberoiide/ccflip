@@ -16,15 +16,18 @@ One static Rust binary, nine subcommands:
 | `ccflip watch` | rotation, mid-session tier switching, policy guard, alerts (systemd unit) |
 | `ccflip sso-guard` | keep AWS SSO / gcloud credentials fresh (systemd, adaptive) |
 | `ccflip status` | every guarded account (AWS SSO, gcloud) and its state, as JSON |
+| `ccflip login <provider>.<account>` | log in to one guarded account (`aws.heka`, `gcloud.me@x.com`) |
+| `ccflip ui` | live terminal dashboard: credentials + Claude accounts (works over SSH) |
 | `ccflip statusline` | print the account chip for the statusline |
 | `ccflip install` | claude-swap + systemd units on this host |
 | `ccflip update` | replace itself with the latest GitHub release |
 
 ccflip is a drop-in claude binary, so it reserves no flags: `--help` and
-`--version` reach claude, and the argument-free subcommands above are
-recognized only when alone (`ccflip who am i` is a prompt). `bedrock` takes
-claude args, so it is matched as the first word. `ccflip -- <word>` forces
-any reserved word through.
+`--version` reach claude, and a subcommand above is taken only when it
+parses exactly (`ccflip who am i`, `ccflip login` alone are prompts). The
+parser is clap; `ccflip help` is its generated help. `bedrock` takes claude
+args verbatim, so it is matched as the first word. `ccflip -- <word>`
+forces any reserved word through.
 
 ## What it does
 
@@ -241,6 +244,11 @@ plus one line in `PROVIDERS`.
 `state` is `ok`, `expiring` (renewed on the next run), `expired` or `error`
 (could not tell; retried). `needs_you`: a login only a human can finish is
 pending, and a notification is up.
+
+`ccflip ui` shows the same rows live (plus the Claude accounts cswap knows:
+5h / 7d / spend, health), refreshed every minute and over SSH too:
+`↑↓` select, `l` log in to the selected account, `r` refresh, `q` quit.
+`ccflip login <provider>.<account>` does the same login from a script.
 
 ### AWS IAM Identity Center
 

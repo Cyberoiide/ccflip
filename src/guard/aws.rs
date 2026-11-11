@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::{Account, Provider, Run, ask_login, clear_needs_you, needs_you};
-use crate::{cswap, epoch, now, stamp};
+use crate::{clock, cswap, epoch, now, stamp};
 
 pub struct Aws;
 
@@ -423,17 +423,6 @@ fn used_recently(s: &Session) -> Option<String> {
             .contains(account)
             .then(|| format!("acct {account} creds minted {}", clock(minted.as_second())))
     })
-}
-
-/// Local wall-clock HH:MM for the journal.
-fn clock(epoch: i64) -> String {
-    jiff::Timestamp::from_second(epoch)
-        .map(|t| {
-            t.to_zoned(jiff::tz::TimeZone::system())
-                .strftime("%H:%M")
-                .to_string()
-        })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

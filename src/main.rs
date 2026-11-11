@@ -12,9 +12,9 @@
 //! Also serves as t3code's claude binary (settings -> Claude -> binary path)
 //! and, symlinked as `claude`, as the shim for spawners that ignore that
 //! setting. GUI spawns may carry a minimal PATH, hence the PATH append.
-//! Because it is a drop-in claude binary, ccflip reserves NO flags and
-//! intercepts its argument-free subcommands only when they are the sole
-//! argument — everything else passes through.
+//! Because it is a drop-in claude binary, ccflip reserves NO flags: its own
+//! subcommands (see [`Cmd`]) are taken only when they parse exactly, and
+//! everything else — `--help`, `-p …`, `who am i` — passes through.
 
 mod budget;
 mod cswap;
@@ -25,6 +25,7 @@ mod limits;
 mod policy;
 mod proc;
 mod select;
+mod ui;
 mod update;
 mod watch;
 
@@ -32,20 +33,66 @@ use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "\
-usage: ccflip [--] [claude args…]   route to the right account and launch
-       ccflip bedrock [args…]       force the Bedrock tier for this launch
-       ccflip who                   account of every running claude session
-       ccflip budget                dollar meters + this host's Bedrock use
-       ccflip watch                 pinned-session rotation, policy, alerts
-       ccflip sso-guard             keep AWS SSO / gcloud credentials fresh (systemd)
-       ccflip status                every guarded account and its state (JSON)
-       ccflip statusline            print the account chip (statusline hook)
-       ccflip install               systemd units + claude-swap on this host
-       ccflip update                self-update from the latest GitHub release
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
-Reserved words above are ccflip's; everything else passes through to claude.
-Use `ccflip -- who` to pass a reserved word through.";
+/// Launch Claude Code on the right account for this directory.
+#[derive(Parser)]
+#[command(
+    name = "ccflip",
+    override_usage = "ccflip [--] [claude args…]      route to the right account and launch\n       \
+                      ccflip bedrock [claude args…]   force the Bedrock tier for this launch\n       \
+                      ccflip <COMMAND>",
+    after_help = "Anything else passes through to claude; `ccflip -- who` escapes a reserved word."
+)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Account of every running claude session
+    Who,
+    /// Dollar meters + this host's Bedrock use
+    Budget,
+    /// Pinned-session rotation, policy, alerts (systemd unit)
+    Watch,
+    /// Keep AWS SSO / gcloud credentials fresh (systemd unit)
+    SsoGuard,
+    /// Every guarded account and its state, as JSON
+    Status,
+    /// Log in to one guarded account, named as in `ccflip status`
+    Login {
+        /// `<provider>.<account>`, e.g. aws.heka or gcloud.me@example.com
+        account: String,
+    },
+    /// Live dashboard: guarded credentials and Claude accounts
+    Ui,
+    /// Print the account chip (statusline hook)
+    Statusline,
+    /// Systemd units + claude-swap on this host
+    Install,
+    /// Self-update from the latest GitHub release
+    Update,
+}
+
+/// ccflip's own command, or `None` = these args are claude's. No flags of
+/// ours: `--help`/`--version` (anywhere) must reach the configured claude
+/// binary — probes against it must see claude's answers.
+fn own_command(args: &[OsString]) -> Option<Cmd> {
+    let cli = Cli::command()
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .mut_subcommands(|c| c.disable_help_flag(true));
+    match cli
+        .try_get_matches_from(std::iter::once(OsString::from("ccflip")).chain(args.iter().cloned()))
+    {
+        Ok(m) => Cli::from_arg_matches(&m).ok().map(|c| c.cmd),
+        // `ccflip help [cmd]` is ours; every other mismatch belongs to claude.
+        Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelp => e.exit(),
+        Err(_) => None,
+    }
+}
 
 fn main() {
     ensure_local_bin_on_path();
@@ -71,32 +118,29 @@ fn main() {
         route(&args)
     }
 
-    // `bedrock` takes claude args, so it is matched as the first word; the
-    // argument-free subcommands are matched only alone, which keeps
-    // `ccflip who is on call` a prompt. `ccflip -- <word>` escapes either.
+    // `bedrock` takes claude args verbatim (`--` included), so it is matched
+    // as the first word, before any parsing. `ccflip -- <word>` escapes
+    // every reserved word.
     if args.first().is_some_and(|a| a == "bedrock") {
         launch::force_bedrock(&args[1..])
     }
-    if args.len() == 1 {
-        match args[0].to_str() {
-            Some("who") => return who(),
-            Some("budget") => return budget::run(),
-            Some("watch") => watch::run(),
-            Some("sso-guard") => std::process::exit(guard::run()),
-            Some("status") => return guard::status(),
-            Some("statusline") => return statusline(),
-            Some("install") => return exit_on_err(install::run()),
-            Some("update") => return exit_on_err(update::run()),
-            Some("help") => return println!("{USAGE}"),
-            // No flag interception (--help/--version go to claude): probes
-            // against the configured claude binary must see claude's answers.
-            _ => {}
-        }
-    }
     if args.first().is_some_and(|a| a == "--") {
         args.remove(0);
+        route(&args)
     }
-    route(&args)
+    match own_command(&args) {
+        None => route(&args),
+        Some(Cmd::Who) => who(),
+        Some(Cmd::Budget) => budget::run(),
+        Some(Cmd::Watch) => watch::run(),
+        Some(Cmd::SsoGuard) => std::process::exit(guard::run()),
+        Some(Cmd::Status) => guard::status(),
+        Some(Cmd::Login { account }) => std::process::exit(guard::login(&account)),
+        Some(Cmd::Ui) => exit_on_err(ui::run()),
+        Some(Cmd::Statusline) => statusline(),
+        Some(Cmd::Install) => exit_on_err(install::run()),
+        Some(Cmd::Update) => exit_on_err(update::run()),
+    }
 }
 
 /// argv[0] shim check: a `claude` symlink pointing at this binary makes every
@@ -265,6 +309,17 @@ pub fn env_parsed<T: std::str::FromStr + std::fmt::Display>(var: &str, default: 
 
 pub fn now() -> i64 {
     jiff::Timestamp::now().as_second()
+}
+
+/// Local wall-clock HH:MM (journal lines, the UI).
+pub fn clock(epoch: i64) -> String {
+    jiff::Timestamp::from_second(epoch)
+        .map(|t| {
+            t.to_zoned(jiff::tz::TimeZone::system())
+                .strftime("%H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
 }
 
 /// An epoch second as the RFC 3339 stamp botocore writes (`…T12:00:00Z`).

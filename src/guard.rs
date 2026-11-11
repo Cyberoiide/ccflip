@@ -136,12 +136,37 @@ pub fn run() -> i32 {
 
 /// `ccflip status`: every provider's accounts as a JSON array.
 pub fn status() {
-    let run = Run::new();
-    let rows: Vec<Account> = PROVIDERS.iter().flat_map(|p| p.status(&run)).collect();
     println!(
         "{}",
-        serde_json::to_string_pretty(&rows).unwrap_or_default()
+        serde_json::to_string_pretty(&accounts()).unwrap_or_default()
     );
+}
+
+/// Every provider's accounts: `ccflip status` rows, the UI's table.
+pub fn accounts() -> Vec<Account> {
+    let run = Run::new();
+    PROVIDERS.iter().flat_map(|p| p.status(&run)).collect()
+}
+
+fn provider_account(key: &str) -> Option<(&'static dyn Provider, &str)> {
+    let (id, account) = key.split_once('.')?;
+    Some((*PROVIDERS.iter().find(|p| p.id() == id)?, account))
+}
+
+/// `ccflip login <provider>.<account>` (and the notification's click):
+/// interactive login, then re-run the guard so the next check is scheduled
+/// from the new token.
+pub fn login(key: &str) -> i32 {
+    let Some((p, account)) = provider_account(key) else {
+        eprintln!("ccflip: unknown account {key} (see `ccflip status`: <provider>.<account>)");
+        return 1;
+    };
+    let ok = p.login(account);
+    if ok {
+        clear_needs_you(p, account);
+    }
+    systemctl_quiet(&["start", "--no-block", "sso-guard.service"]);
+    i32::from(!ok)
 }
 
 /// A login that needs a human: one persistent notification, login on
@@ -187,10 +212,7 @@ pub fn ask_login(p: &dyn Provider, account: &str) {
 /// The detached half of [`ask_login`]: wait for the click, then log in
 /// and re-run the guard so the next check is scheduled from the new token.
 fn ask_and_login(key: &str) -> i32 {
-    let Some((p, account)) = key
-        .split_once('.')
-        .and_then(|(id, account)| Some((PROVIDERS.iter().find(|p| p.id() == id)?, account)))
-    else {
+    let Some((p, account)) = provider_account(key) else {
         eprintln!("sso-guard: unknown SSO_GUARD_ASK={key}");
         return 1;
     };
@@ -205,10 +227,7 @@ fn ask_and_login(key: &str) -> i32 {
         let _ = fs::write(dismissed(key), "");
         return 0;
     }
-    if p.login(account) {
-        clear_needs_you(*p, account);
-    }
-    systemctl_quiet(&["start", "--no-block", "sso-guard.service"]);
+    login(key);
     0
 }
 

@@ -224,6 +224,38 @@ esac
     // …and `--` forces even a lone reserved word through to claude.
     let out = run(t, false, &["--", "who"]);
     check(&out, "ARGS=who", "double-dash-escape");
+    // ccflip owns no flags: whatever its parser does not take exactly is
+    // claude's — probes against the configured binary see claude's answers.
+    for (args, wanted, case) in [
+        (&["--help"][..], "ARGS=--help", "help-flag-is-claudes"),
+        (
+            &["--version"][..],
+            "ARGS=--version",
+            "version-flag-is-claudes",
+        ),
+        (
+            &["who", "--help"][..],
+            "ARGS=who --help",
+            "subcommand-help-flag-is-claudes",
+        ),
+        (
+            &["login"][..],
+            "ARGS=login",
+            "login-without-account-is-a-prompt",
+        ),
+        (
+            &["status", "now"][..],
+            "ARGS=status now",
+            "status-with-args-is-a-prompt",
+        ),
+        (
+            &["ui", "-p", "x"][..],
+            "ARGS=ui -p x",
+            "ui-with-args-is-a-prompt",
+        ),
+    ] {
+        check(&run(t, false, args), wanted, case);
+    }
 
     // Mapped + qm healthy per cswap BUT freshly limit-flagged (a transcript
     // error beat the usage poll) -> alternate account immediately.
@@ -393,4 +425,32 @@ fn empty_path_never_runs_the_cwd() {
         .output()
         .unwrap();
     assert!(!t.path().join("pwned").exists());
+}
+
+/// `ccflip help` is ccflip's own and lists every command; nothing reaches
+/// claude.
+#[test]
+fn help_lists_ccflips_commands() {
+    let out = Command::new(env!("CARGO_BIN_EXE_ccflip"))
+        .arg("help")
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    for cmd in [
+        "who",
+        "budget",
+        "watch",
+        "sso-guard",
+        "status",
+        "login",
+        "ui",
+        "statusline",
+        "install",
+        "update",
+        "ccflip bedrock",
+    ] {
+        assert!(text.contains(cmd), "help lacks {cmd}:\n{text}");
+    }
 }

@@ -419,3 +419,29 @@ c.commit()
         "error"
     );
 }
+
+#[test]
+fn login_command_runs_the_providers_login_and_clears_its_marker() {
+    for (key, wanted) in [
+        ("aws.heka", "aws sso login --sso-session heka"),
+        ("gcloud.me@x.com", "gcloud auth login me@x.com"),
+    ] {
+        let h = Home::new();
+        fs::write(h.marker(key), "").unwrap();
+        h.ccflip(&["login", key], &[]);
+        let calls = h.calls();
+        assert!(calls.contains(wanted), "{key}: {calls}");
+        assert!(
+            calls.contains("start --no-block sso-guard.service"),
+            "re-runs the guard: {calls}"
+        );
+        assert!(!h.marker(key).exists(), "{key}");
+    }
+}
+
+#[test]
+fn login_command_rejects_an_unknown_account() {
+    let h = Home::new();
+    let out = h.ccflip(&["login", "nope"], &[]);
+    assert!(out.contains("unknown account nope"), "{out}");
+}

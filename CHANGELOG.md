@@ -36,6 +36,15 @@ case by case against the bash versions (see Testing).
   application-default credentials; a dead refresh token posts the login
   notification for the active account and ADC, never a browser unasked.
 - `ccflip status`: every account's state as JSON, the contract for a UI.
+- `ccflip ui` (ratatui): live terminal dashboard of the credentials and the
+  Claude accounts, works over SSH; `l` logs in to the selected account.
+- `ccflip login <provider>.<account>`: the same login from a script.
+
+### CLI
+
+- Subcommands are parsed by clap (generated `ccflip help`), still under the
+  drop-in rule: anything that does not parse exactly as ccflip's own command
+  passes through to claude, `--help`/`--version` included.
 - The refresh token is redeemed with a direct HTTPS call instead of
   `aws sso-oidc create-token`: the refresh token and client secret no longer
   appear in a command line any local user can read from `/proc`, and a run

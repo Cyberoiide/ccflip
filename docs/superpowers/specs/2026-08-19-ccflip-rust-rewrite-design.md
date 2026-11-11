@@ -43,6 +43,7 @@ sourced by a shell.
 - `src/guard.rs` — `ccflip sso-guard` / `ccflip status`: the `Provider`
   trait, on/off switch, adaptive re-arm, "a human is needed" notification
 - `src/guard/aws.rs`, `src/guard/gcloud.rs` — the providers
+- `src/ui.rs` — `ccflip ui`, the terminal dashboard
 
 ## Credential providers
 
@@ -58,8 +59,18 @@ persistent notification per account, re-entering the binary via
   stderr naming the login command = dead credentials, anything else =
   transient error. Classification checked against real gcloud 593 output.
 
-A UI (tray icon, dashboard) is next: it reads `ccflip status` and triggers
-logins the same way the notification does.
+`ccflip ui` (`src/ui.rs`, ratatui + crossterm) is the first UI: it reads
+`guard::accounts()` and `cswap::list()` on a thread, and logs in through
+`guard::login` — the same path as `ccflip login` and the notification. A
+tray icon or dashboard window would reuse exactly those two calls.
+
+## CLI parsing
+
+clap (derive) parses ccflip's own subcommands. Drop-in rule: help/version
+flags are disabled everywhere and any parse failure means "these args are
+claude's", so `--help`, `-p …`, `who am i` reach claude unchanged.
+`bedrock` and `--` are handled before clap because they take claude args
+verbatim.
 
 ## Behavior parity notes
 
