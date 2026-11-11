@@ -12,9 +12,12 @@ pub fn run() -> Result<()> {
     cfg.repo_owner(owner)
         .repo_name(name)
         .bin_name("ccflip")
+        // Releases ship one static musl build; a `cargo install` (gnu) binary
+        // must still find it.
+        .target(&format!("{}-unknown-linux-musl", env::consts::ARCH)[..])
         .current_version(self_update::cargo_crate_version!())
         .show_download_progress(true);
-    // Private repo: releases need an authenticated request.
+    // Optional: lifts GitHub's anonymous rate limit (and a private repo).
     if let Ok(token) = env::var("GITHUB_TOKEN").or_else(|_| env::var("GH_TOKEN")) {
         cfg.auth_token(&token);
     }

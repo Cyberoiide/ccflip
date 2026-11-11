@@ -5,6 +5,7 @@
 //! (exe under .../claude/versions/) and anything literally named claude.
 
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -38,7 +39,7 @@ impl ClaudeProc {
 }
 
 pub fn claude_procs() -> Vec<ClaudeProc> {
-    let Ok(entries) = fs::read_dir("/proc") else {
+    let (Ok(entries), Ok(me)) = (fs::read_dir("/proc"), fs::metadata("/proc/self")) else {
         return Vec::new();
     };
     entries
@@ -46,6 +47,10 @@ pub fn claude_procs() -> Vec<ClaudeProc> {
         .filter_map(|entry| {
             let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
             let dir = entry.path();
+            // Ours only: run as root, the watcher must not end other users' sessions.
+            if fs::metadata(&dir).ok()?.uid() != me.uid() {
+                return None;
+            }
             let exe = fs::read_link(dir.join("exe")).ok()?;
             let is_claude = exe.to_string_lossy().contains("/claude/versions/")
                 || exe.file_name().is_some_and(|n| n == "claude");

@@ -29,6 +29,18 @@ pub fn usable(a: &Account, thr: f64, spend_thr: f64) -> bool {
     !a.limit_flagged && windows_ok(a, thr) && a.spend_pct().is_none_or(|p| p < spend_thr)
 }
 
+/// May this account keep serving its OWN pinned dir and sessions? A
+/// setup-token account cannot read the usage API ("unavailable") yet works
+/// for requests; a real limit shows up as a transcript flag within a tick.
+/// Never grounds for *choosing* it elsewhere — `electable` stays closed.
+pub fn serves_own(a: &Account, thr: f64, spend_thr: f64) -> bool {
+    usable(a, thr, spend_thr) || setup_token_ok(a)
+}
+
+pub fn setup_token_ok(a: &Account) -> bool {
+    !a.limit_flagged && a.usage_status == UsageStatus::Unavailable
+}
+
 /// May this account be chosen? Same thresholds, but usage must be KNOWN.
 /// Does NOT check `disabled`: a disabled account still serves its own mapped
 /// dirs, so callers that must not borrow it filter that themselves.
@@ -213,6 +225,22 @@ mod tests {
         set_spend(&mut list, 3, 98.0);
         assert!(!usable(&list.accounts[3], 99.0, STHR));
         assert!(!electable(&list.accounts[3], 99.0, STHR));
+    }
+
+    #[test]
+    fn setup_token_serves_its_own_dir_but_is_never_chosen() {
+        let mut list = fixture();
+        let a = &mut list.accounts[1];
+        a.usage_status = UsageStatus::Unavailable;
+        a.usage = None;
+        assert!(!usable(a, 99.0, STHR));
+        assert!(serves_own(a, 99.0, STHR));
+        assert!(!electable(a, 99.0, STHR));
+        a.limit_flagged = true; // a transcript limit takes it out
+        assert!(!serves_own(a, 99.0, STHR));
+        // Never borrowed; its own profile still rotates away, as in bash.
+        assert_ne!(pick_alt(&list, "zz@none", 99.0, STHR).unwrap().number, 2);
+        assert!(pick_target(&list, 2, THR, STHR).is_some());
     }
 
     #[test]

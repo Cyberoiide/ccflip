@@ -18,13 +18,13 @@
 
 mod budget;
 mod cswap;
+mod guard;
 mod install;
 mod launch;
 mod limits;
 mod policy;
 mod proc;
 mod select;
-mod sso;
 mod update;
 mod watch;
 
@@ -38,7 +38,7 @@ usage: ccflip [--] [claude args…]   route to the right account and launch
        ccflip who                   account of every running claude session
        ccflip budget                dollar meters + this host's Bedrock use
        ccflip watch                 pinned-session rotation, policy, alerts
-       ccflip sso-guard             renew AWS SSO before it expires
+       ccflip sso-guard             keep AWS SSO sessions fresh (systemd)
        ccflip statusline            print the account chip (statusline hook)
        ccflip install               systemd units + claude-swap on this host
        ccflip update                self-update from the latest GitHub release
@@ -81,7 +81,7 @@ fn main() {
             Some("who") => return who(),
             Some("budget") => return budget::run(),
             Some("watch") => watch::run(),
-            Some("sso-guard") => std::process::exit(sso::run()),
+            Some("sso-guard") => std::process::exit(guard::run()),
             Some("statusline") => return statusline(),
             Some("install") => return exit_on_err(install::run()),
             Some("update") => return exit_on_err(update::run()),
@@ -113,13 +113,18 @@ fn invoked_as_claude() -> bool {
 /// cswap and claude live in ~/.local/bin, which GUI spawns (t3code) and the
 /// systemd user manager may leave off PATH. APPEND, never prepend: the
 /// caller's explicit PATH order (wrappers, pinned builds, test fakes) wins.
+/// Empty or relative entries are dropped: they mean "the current directory",
+/// and a `claude` shipped in a cloned repo must never be what runs.
 fn ensure_local_bin_on_path() {
     let local_bin = cswap::home().join(".local/bin");
-    let path = env::var_os("PATH").unwrap_or_default();
-    if env::split_paths(&path).any(|p| p == local_bin) {
-        return;
+    let path = env::var_os("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
+    let mut dirs: Vec<PathBuf> = env::split_paths(&path)
+        .filter(|p| p.is_absolute())
+        .collect();
+    if !dirs.contains(&local_bin) {
+        dirs.push(local_bin);
     }
-    if let Ok(new) = env::join_paths(env::split_paths(&path).chain(std::iter::once(local_bin))) {
+    if let Ok(new) = env::join_paths(dirs) {
         // SAFETY: top of main — no other threads yet.
         unsafe { env::set_var("PATH", new) };
     }
@@ -166,7 +171,7 @@ fn route(args: &[OsString]) -> ! {
     if let Some(mapped) = cswap::mapped_email(&routing_dir()) {
         if list
             .by_email(&mapped)
-            .is_some_and(|a| select::usable(a, threshold, spend_threshold))
+            .is_some_and(|a| select::serves_own(a, threshold, spend_threshold))
         {
             launch::go_subscription(None, args); // bare run resolves the mapping itself
         }
@@ -253,5 +258,32 @@ pub fn env_parsed<T: std::str::FromStr + std::fmt::Display>(var: &str, default: 
             eprintln!("ccflip: {var}={raw} is not a number, using {default}");
             default
         }),
+    }
+}
+
+pub fn now() -> i64 {
+    jiff::Timestamp::now().as_second()
+}
+
+/// An RFC 3339 stamp as an epoch second. Also takes the legacy AWS CLI
+/// cache spelling `…T12:00:00UTC`.
+pub fn epoch(stamp: &str) -> Option<i64> {
+    let stamp = stamp
+        .strip_suffix("UTC")
+        .map_or_else(|| stamp.to_string(), |s| format!("{s}Z"));
+    stamp.parse::<jiff::Timestamp>().ok().map(|t| t.as_second())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::epoch;
+
+    #[test]
+    fn epoch_reads_every_aws_cache_spelling() {
+        let z = epoch("2026-11-11T10:00:00Z").unwrap();
+        assert_eq!(epoch("2026-11-11T10:00:00UTC"), Some(z)); // legacy CLI
+        assert_eq!(epoch("2026-11-11T10:00:00.000Z"), Some(z)); // JS SDK
+        assert_eq!(epoch("2026-11-11T11:00:00+01:00"), Some(z));
+        assert_eq!(epoch("tomorrow"), None);
     }
 }

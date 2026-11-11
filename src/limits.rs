@@ -12,12 +12,11 @@ use std::env;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use serde::Deserialize;
 
-use crate::cswap;
+use crate::{cswap, epoch, now};
 
 /// email -> unix time the flag expires.
 pub type Flags = HashMap<String, i64>;
@@ -36,12 +35,6 @@ pub fn path() -> PathBuf {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| cswap::home().join(".local/state/ccflip/limit-flags.json"))
-}
-
-pub fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
 }
 
 pub fn load() -> Flags {
@@ -217,17 +210,6 @@ fn account_for(file: &Path, sessions: &Path, list: &cswap::List) -> Option<Strin
         });
     }
     list.active_account().map(|a| a.email.clone())
-}
-
-/// ponytail: `date -d` for one RFC3339 stamp, and only for a file that
-/// already contains a limit error — a datetime crate would earn its keep only
-/// if timestamps needed real arithmetic.
-fn epoch(stamp: &str) -> Option<i64> {
-    let out = Command::new("date")
-        .args(["-d", stamp, "+%s"])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 #[cfg(test)]

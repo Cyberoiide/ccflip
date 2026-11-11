@@ -1,12 +1,9 @@
 [Unit]
-Description=Check AWS SSO freshness every 15 minutes
+Description=AWS SSO freshness backstop (sso-guard re-arms itself adaptively)
 
 [Timer]
 OnStartupSec=2min
-# Must stay shorter than SSO_GUARD_MIN_MINUTES (45): a poll slower than the
-# renewal threshold lets a token expire between runs, turning a silent
-# refresh into a browser login.
-OnCalendar=*:00/15
+OnCalendar=hourly
 Persistent=true
 
 [Install]

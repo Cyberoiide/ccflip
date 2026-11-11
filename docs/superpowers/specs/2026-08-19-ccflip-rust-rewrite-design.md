@@ -40,6 +40,19 @@ sourced by a shell.
 - `src/install.rs` — claude-swap bootstrap, systemd units (embedded;
   ExecStart points at `current_exe()`)
 - `src/update.rs` — self-update from GitHub releases
+- `src/guard.rs` — `ccflip sso-guard`: provider-agnostic on/off switch,
+  adaptive re-arm, "a human is needed" notification
+- `src/guard/aws.rs` — the AWS Identity Center provider (2026-11-11 port of
+  the bash version's final design)
+
+## Credential providers (planned: gcloud)
+
+sso-guard is meant to keep more than AWS alive. A provider is a sibling
+module of `guard/aws.rs` with one `check(&mut Run)` called from
+`guard::run`: it reports wake-ups (`Run::track`/`Run::want`), failures
+(`Run::failed`) and human logins (`Run::ask_login`). gcloud is next; no
+trait until a second provider shows what is truly shared. A UI (tray,
+dashboard) comes after and reads the same state.
 
 ## Behavior parity notes
 
@@ -59,4 +72,8 @@ sourced by a shell.
 - `tests/routing.rs`: direct port of `tests/bedrock_fallback_test.sh` —
   fake `cswap`/`claude` scripts on PATH record what reached them; all six
   routing scenarios asserted end to end.
+- `tests/sso_guard.rs`: every sso-guard decision end to end against a fake
+  OIDC server and fake `aws`/`systemctl`/`systemd-run`/`notify-send`. With
+  `SSO_GUARD_ORACLE=<old bin/sso-guard>` each scenario also runs the bash
+  version and must reach identical decisions.
 - CI (`ci.yml`): fmt, clippy `-D warnings`, tests on every push/PR.

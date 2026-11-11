@@ -51,7 +51,7 @@ fn tick(ticks: u64, alerted: &mut HashSet<String>) {
         // anything, then re-apply so this tick acts on what it just learned.
         let ttl = policy.knob("CCFLIP_LIMIT_FLAG_TTL", 900i64);
         let fresh = policy.knob("CCFLIP_LIMIT_FRESH_SECS", 120i64);
-        for email in limits::scan(&list, ttl, fresh, limits::now()) {
+        for email in limits::scan(&list, ttl, fresh, crate::now()) {
             println!(
                 "limit-hit in a live transcript: {email} flagged unusable for {}s",
                 ttl
@@ -251,7 +251,7 @@ fn switch_tiers(list: &cswap::List, policy: &policy::Policy, thr: Thresholds) {
                 && eligible
                 && transcript_idle(p.config_dir.as_deref(), &p.cwd, switchback_idle),
             // Would a relaunch avoid this account? Launcher's line.
-            account_healthy: account.map(|a| select::usable(a, switch_thr, switch_spend)),
+            account_healthy: account.map(|a| select::serves_own(a, switch_thr, switch_spend)),
             covered: match (&p.config_dir, account) {
                 // Rotation will move this profile's credentials — that is the
                 // watcher's own job, so it is judged by the rotation line.
@@ -302,10 +302,9 @@ fn subscription_ready(
     spend_threshold: f64,
 ) -> bool {
     if let Some(mapped) = cswap::mapped_email(cwd) {
-        return list
-            .by_email(&mapped)
-            .is_some_and(|a| select::electable(a, threshold, spend_threshold))
-            || any_electable;
+        return list.by_email(&mapped).is_some_and(|a| {
+            select::electable(a, threshold, spend_threshold) || select::setup_token_ok(a)
+        }) || any_electable;
     }
     any_electable
 }

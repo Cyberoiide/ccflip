@@ -262,6 +262,35 @@ esac
     );
     fs::remove_file(&flags).unwrap();
 
+    // Mapped + qm on a setup-token (usageStatus "unavailable", no usage data)
+    // -> still serves its own pinned dir; a limit flag is what takes it out.
+    fs::write(
+        t.join("list.json"),
+        list_json("5", "ok", "14").replace(
+            r#""usageStatus":"ok","disabled":true,
+  "usage":{"fiveHour":{"pct":5,"resetsAt":"x"},"sevenDay":{"pct":5,"resetsAt":"x"}}"#,
+            r#""usageStatus":"unavailable","disabled":true,"usage":null"#,
+        ),
+    )
+    .unwrap();
+    assert!(
+        fs::read_to_string(t.join("list.json"))
+            .unwrap()
+            .contains("unavailable")
+    );
+    check(
+        &run(&qmdir.join("darkfindr"), false, hello),
+        "VIA=cswap-run ACCT=default BEDROCK=unset ROUTED=1",
+        "mapped-token-unavailable",
+    );
+    fs::write(&flags, format!(r#"{{"qm@x.com":{soon}}}"#)).unwrap();
+    check(
+        &run(&qmdir.join("darkfindr"), false, hello),
+        "VIA=cswap-run ACCT=sia@x.com BEDROCK=unset ROUTED=1",
+        "mapped-token-flagged",
+    );
+    fs::remove_file(&flags).unwrap();
+
     // `ccflip bedrock [args]` forces the tier even with quota to spare.
     fs::write(t.join("bedrock.env"), "export CLAUDE_CODE_USE_BEDROCK=1\n").unwrap();
     list("5", "ok");
@@ -345,4 +374,23 @@ esac
             "shim-bypass-{var}: must reach claude directly, got:\n{out}"
         );
     }
+}
+
+/// An empty PATH entry means "the current directory" to execvp: a `claude`
+/// or `cswap` shipped in a cloned repo must never be what ccflip runs.
+#[test]
+fn empty_path_never_runs_the_cwd() {
+    let t = tempfile::tempdir().unwrap();
+    for tool in ["claude", "cswap"] {
+        write_exec(&t.path().join(tool), "#!/bin/sh\necho PWNED > pwned\n");
+    }
+    let _ = Command::new(env!("CARGO_BIN_EXE_ccflip"))
+        .args(["-p", "hi"])
+        .current_dir(t.path())
+        .env_clear()
+        .env("HOME", t.path())
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    assert!(!t.path().join("pwned").exists());
 }

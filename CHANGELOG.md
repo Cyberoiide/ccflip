@@ -1,5 +1,56 @@
 # Changelog
 
+## v2.0.0 — unreleased
+
+Rewrite in Rust: one static binary (`ccflip`, plus `watch`, `sso-guard`,
+`statusline`, `install`, `update`) replaces `bin/ccflip`, `bin/ccflip-watch`,
+`bin/claude-shim`, `bin/sso-guard`, `statusline.sh` and `install.sh`.
+Behaviour is the v1.0.0 behaviour plus everything on master since, checked
+case by case against the bash versions (see Testing).
+
+### Breaking
+
+- `~/.claude/bedrock.env` is parsed as plain `KEY=VALUE` lines (an optional
+  leading `export` is accepted) instead of being sourced by a shell.
+- Install via `cargo binstall` or a GitHub release; `ccflip install` writes the
+  systemd units pointing at the binary. `sso-guard.service` is now
+  `ExecStart=<binary> sso-guard`: hand-written units must be updated, and
+  per-host knobs (`SSO_GUARD_BROWSER`, `SSO_GUARD_MIN_MINUTES`) belong in a
+  drop-in (`systemctl --user edit sso-guard.service`) so reinstalling keeps
+  them.
+- The `claude` shim is a symlink to the binary (`ln -sf "$(command -v ccflip)"
+  ~/.local/bin/claude`) instead of a script.
+
+### sso-guard
+
+- Same decisions as the bash version (silent refresh, capped-session sleep,
+  in-use gating, one browser try then one notification), now in
+  `src/guard.rs` (scheduling, notifications) + `src/guard/aws.rs` (Identity
+  Center). Other providers (gcloud next) slot in as sibling modules.
+- The refresh token is redeemed with a direct HTTPS call instead of
+  `aws sso-oidc create-token`: the refresh token and client secret no longer
+  appear in a command line any local user can read from `/proc`, and a run
+  no longer pays the AWS CLI's Python start-up.
+- A cache entry whose `region` is not a plain region name is never contacted
+  (the region becomes the host the secrets are posted to).
+
+### Routing
+
+- One shared account-selection implementation for the launcher and the
+  watcher (the bash version had three divergent jq programs).
+- setup-token accounts (usage `"unavailable"`) keep serving their own pinned
+  dir and sessions, as on master since v1.0.0.
+
+### Testing
+
+- `cargo test`: unit tests for every selection rule and parser, end-to-end
+  routing/watcher/sso-guard runs against fakes. `SSO_GUARD_ORACLE=<old
+  bin/sso-guard> cargo test --test sso_guard` replays every sso-guard
+  scenario against the bash version and fails on any differing decision.
+- `cargo test -- --ignored`: the real AWS CLI reading the token cache we
+  write, and the tier switcher signalling real processes (run it in a PID
+  namespace: `unshare -rpf --mount-proc cargo test -- --ignored`).
+
 ## v1.0.0 — 2026-09-06
 
 First tagged release. Per-project Claude Code account routing across two

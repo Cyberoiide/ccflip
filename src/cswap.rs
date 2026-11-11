@@ -13,6 +13,9 @@ use serde::Deserialize;
 pub enum UsageStatus {
     #[serde(rename = "ok")]
     Ok,
+    /// setup-token: cannot read the usage API, yet serves requests fine.
+    #[serde(rename = "unavailable")]
+    Unavailable,
     /// Anything not "ok" (token_expired, …) — never usable, never a target.
     #[serde(other)]
     NotOk,

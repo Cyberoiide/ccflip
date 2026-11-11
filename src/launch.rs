@@ -238,7 +238,7 @@ fn rewrite_model(args: &[OsString], model: &str) -> Vec<OsString> {
 /// command substitution. Anything unparseable is warned about loudly.
 pub(crate) fn parse_env_file(text: &str) -> Vec<(String, String)> {
     let mut vars = Vec::new();
-    for line in text.lines() {
+    for (n, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -248,17 +248,18 @@ pub(crate) fn parse_env_file(text: &str) -> Vec<(String, String)> {
             let key = key.trim();
             let ident =
                 !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-            ident.then(|| (key.to_string(), parse_value(value.trim(), line)))
+            ident.then(|| (key.to_string(), parse_value(value.trim(), key)))
         });
         match parsed {
             Some(kv) => vars.push(kv),
-            None => eprintln!("ccflip: ignoring unparseable env-file line: {line}"),
+            // Line number only: the line itself may carry a token.
+            None => eprintln!("ccflip: ignoring unparseable env-file line {}", n + 1),
         }
     }
     vars
 }
 
-fn parse_value(raw: &str, line: &str) -> String {
+fn parse_value(raw: &str, key: &str) -> String {
     for q in ['"', '\''] {
         if let Some(inner) = raw.strip_prefix(q).and_then(|s| s.strip_suffix(q)) {
             return inner.to_string();
@@ -267,7 +268,7 @@ fn parse_value(raw: &str, line: &str) -> String {
     let (value, rest) = raw.split_once(char::is_whitespace).unwrap_or((raw, ""));
     let rest = rest.trim_start();
     if !rest.is_empty() && !rest.starts_with('#') {
-        eprintln!("ccflip: ignoring trailing text after value in env line: {line}");
+        eprintln!("ccflip: ignoring trailing text after {key}'s value");
     }
     value.to_string()
 }

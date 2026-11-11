@@ -33,6 +33,14 @@ pub fn run() -> Result<()> {
     )?;
     let exe = env::current_exe().context("resolving own binary path")?;
     let exe_str = exe.display().to_string();
+    // systemd: quote the path, double `%` (its specifier character).
+    let exe_unit = format!(
+        "\"{}\"",
+        exe_str
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+    );
     for (name, template) in [
         (
             "ccflip-watch.service",
@@ -43,7 +51,7 @@ pub fn run() -> Result<()> {
             include_str!("../systemd/sso-guard.service.in"),
         ),
     ] {
-        fs::write(unit_dir.join(name), template.replace("{exe}", &exe_str))?;
+        fs::write(unit_dir.join(name), template.replace("{exe}", &exe_unit))?;
     }
     fs::write(
         unit_dir.join("sso-guard.timer"),

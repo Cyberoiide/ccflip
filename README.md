@@ -14,7 +14,7 @@ One static Rust binary, nine subcommands:
 | `ccflip budget` | real dollar meters + this host's Bedrock consumption |
 | `ccflip who` | account of every running claude session (PID, account, cwd) |
 | `ccflip watch` | rotation, mid-session tier switching, policy guard, alerts (systemd unit) |
-| `ccflip sso-guard` | renew AWS SSO before it expires (systemd timer) |
+| `ccflip sso-guard` | keep AWS SSO sessions fresh (systemd, adaptive) |
 | `ccflip statusline` | print the account chip for the statusline |
 | `ccflip install` | claude-swap + systemd units on this host |
 | `ccflip update` | replace itself with the latest GitHub release |
@@ -223,16 +223,35 @@ limits and push healthy work onto the paid tier for nothing.
 
 ## SSO freshness (hosts using an AWS profile)
 
-`ccflip sso-guard` keeps the SSO session alive so the Bedrock tier never dies
-with "Token is expired": it silently renews the access token via the SSO
-refresh token when under `SSO_GUARD_MIN_MINUTES` (45) left, and opens the
-one-click browser login only once the token is actually spent (a renewal that
-did not happen yet is not a dead session — STS can answer from cached role
-credentials). A systemd timer runs it every 15 minutes: the poll has to stay
-shorter than the 45-minute renewal threshold, or a token can expire between
-runs. `ccflip install` enables it only where `~/.aws/config` exists —
-instance-role hosts have nothing to guard. Claude Code's own `awsAuthRefresh`
-setting stays as the in-session belt.
+`ccflip sso-guard` keeps every AWS IAM Identity Center session in
+`~/.aws/config` alive so the Bedrock tier never dies with "Token is expired".
+Each run, per `[sso-session]` some profile uses:
+
+1. Token healthy: nothing; the next run is armed ~1 min before it drops under
+   `SSO_GUARD_MIN_MINUTES` (default 15).
+2. Token low: the cached SSO refresh token is redeemed directly (OIDC
+   `CreateToken`, no browser) and written back to the CLI cache. A refresh
+   that buys under 50 min means the Identity Center session itself ends then:
+   it sleeps until that end instead of retrying every minute.
+3. Session over: one browser login, click-free while the browser is still
+   signed in. If that times out, one persistent notification ("click to log
+   in") instead of a new tab every run; dismissed, it asks again after 2 h.
+
+`SSO_GUARD_BROWSER` (space-separated session names, default `*` = all) limits
+which sessions may log in on their own. The others are kept alive silently
+and re-logged only while something uses them: a process with
+`--profile P` / `AWS_PROFILE=P`, or role credentials minted for one of its
+accounts in the last 65 min. Unused, they lapse quietly — log in on demand.
+
+Scheduling: a oneshot `sso-guard.service`, re-armed adaptively through a
+transient `sso-guard-next` timer; the hourly `sso-guard.timer` is only the
+reboot-safe backstop, and disabling it (`sso-off`) stops everything. Set
+knobs in a drop-in: `systemctl --user edit sso-guard.service` →
+`[Service]` / `Environment=SSO_GUARD_BROWSER=heka`. `ccflip install` enables
+it only where `~/.aws/config` exists — instance-role hosts have nothing to
+guard. It never changes Identity Center settings (session length is the org's
+policy). Claude Code's own `awsAuthRefresh` setting stays as the in-session
+belt.
 
 ## Gotchas
 
@@ -298,9 +317,10 @@ Read-only commands (`ccflip who`, `ccflip budget`, `ccflip statusline`) are
 safe as-is, and for the rest point the seams at copies:
 
 ```bash
-CCFLIP_MAPPINGS=/tmp/try/mappings.json CCFLIP_BEDROCK_ENV=/tmp/try/bedrock.env \
+try=$(mktemp -d)   # private: bedrock.env reaches claude's environment
+CCFLIP_MAPPINGS=$try/mappings.json CCFLIP_BEDROCK_ENV=$try/bedrock.env \
   ./target/debug/ccflip -p hello
-XDG_DATA_HOME=/tmp/try CCFLIP_POLICY=/tmp/try/policy.env \
+XDG_DATA_HOME=$try CCFLIP_POLICY=$try/policy.env \
   CCFLIP_WATCH_ONCE=1 CCFLIP_NO_TIER_SWITCH=1 ./target/debug/ccflip watch
 ```
 
