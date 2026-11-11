@@ -1,0 +1,9 @@
+[Unit]
+Description=Keep AWS SSO / gcloud credentials fresh (ccflip sso-guard)
+
+[Service]
+Type=oneshot
+ExecStart={exe} sso-guard
+# `aws sso login` waits for a human in a browser; the 90s default would kill
+# the flow mid-login and leave the token unrenewed.
+TimeoutStartSec=0

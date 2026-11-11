@@ -1,0 +1,353 @@
+//! ccflip — launch Claude Code on the right "account" for this directory.
+//!
+//! Mapped dir (cswap map):  its pinned account -> any other enabled usable
+//!                          account -> Bedrock.
+//! Anywhere else:           the default login (cswap auto guards it) ->
+//!                          Bedrock only when no subscription account works.
+//!
+//! ~/.claude/bedrock.env holds the per-host Bedrock config; `ccflip bedrock`
+//! forces that tier. Proactive rotation of the default login is the
+//! cswap-auto daemon's job — this launcher only routes.
+//!
+//! Also serves as t3code's claude binary (settings -> Claude -> binary path)
+//! and, symlinked as `claude`, as the shim for spawners that ignore that
+//! setting. GUI spawns may carry a minimal PATH, hence the PATH append.
+//! Because it is a drop-in claude binary, ccflip reserves NO flags: its own
+//! subcommands (see [`Cmd`]) are taken only when they parse exactly, and
+//! everything else — `--help`, `-p …`, `who am i` — passes through.
+
+mod budget;
+mod cswap;
+mod guard;
+mod install;
+mod launch;
+mod limits;
+mod policy;
+mod proc;
+mod select;
+mod ui;
+mod update;
+mod watch;
+
+use std::env;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+
+/// Launch Claude Code on the right account for this directory.
+#[derive(Parser)]
+#[command(
+    name = "ccflip",
+    override_usage = "ccflip [--] [claude args…]      route to the right account and launch\n       \
+                      ccflip bedrock [claude args…]   force the Bedrock tier for this launch\n       \
+                      ccflip <COMMAND>",
+    after_help = "Anything else passes through to claude; `ccflip -- who` escapes a reserved word."
+)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Account of every running claude session
+    Who,
+    /// Dollar meters + this host's Bedrock use
+    Budget,
+    /// Pinned-session rotation, policy, alerts (systemd unit)
+    Watch,
+    /// Keep AWS SSO / gcloud credentials fresh (systemd unit)
+    SsoGuard,
+    /// Every guarded account and its state, as JSON
+    Status,
+    /// Log in to one guarded account, named as in `ccflip status`
+    Login {
+        /// `<provider>.<account>`, e.g. aws.heka or gcloud.me@example.com
+        account: String,
+    },
+    /// Live dashboard: guarded credentials and Claude accounts
+    Ui,
+    /// Print the account chip (statusline hook)
+    Statusline,
+    /// Systemd units + claude-swap on this host
+    Install,
+    /// Self-update from the latest GitHub release
+    Update,
+}
+
+/// ccflip's own command, or `None` = these args are claude's. No flags of
+/// ours: `--help`/`--version` (anywhere) must reach the configured claude
+/// binary — probes against it must see claude's answers.
+fn own_command(args: &[OsString]) -> Option<Cmd> {
+    let cli = Cli::command()
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .mut_subcommands(|c| c.disable_help_flag(true));
+    match cli
+        .try_get_matches_from(std::iter::once(OsString::from("ccflip")).chain(args.iter().cloned()))
+    {
+        Ok(m) => Cli::from_arg_matches(&m).ok().map(|c| c.cmd),
+        // `ccflip help [cmd]` is ours; every other mismatch belongs to claude.
+        Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelp => e.exit(),
+        Err(_) => None,
+    }
+}
+
+fn main() {
+    ensure_local_bin_on_path();
+    // args_os: a non-UTF8 argument must pass through to claude, not panic us.
+    let mut args: Vec<OsString> = env::args_os().skip(1).collect();
+
+    // Invoked as `claude` (symlink shim, for spawners whose settings cannot
+    // reach ccflip): route only spawns that expressed no preference. The
+    // caller already chose when CCFLIP_ROUTED (our own descendants),
+    // CLAUDE_CONFIG_DIR (an explicit `cswap run` session) or
+    // CLAUDE_CODE_USE_BEDROCK (forced Bedrock) is set.
+    if invoked_as_claude() {
+        let chose_already = [
+            "CCFLIP_ROUTED",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_USE_BEDROCK",
+        ]
+        .iter()
+        .any(|v| env::var_os(v).is_some_and(|x| !x.is_empty()));
+        if chose_already {
+            launch::exec_claude(&args);
+        }
+        route(&args)
+    }
+
+    // `bedrock` takes claude args verbatim (`--` included), so it is matched
+    // as the first word, before any parsing. `ccflip -- <word>` escapes
+    // every reserved word.
+    if args.first().is_some_and(|a| a == "bedrock") {
+        launch::force_bedrock(&args[1..])
+    }
+    if args.first().is_some_and(|a| a == "--") {
+        args.remove(0);
+        route(&args)
+    }
+    match own_command(&args) {
+        None => route(&args),
+        Some(Cmd::Who) => who(),
+        Some(Cmd::Budget) => budget::run(),
+        Some(Cmd::Watch) => watch::run(),
+        Some(Cmd::SsoGuard) => std::process::exit(guard::run()),
+        Some(Cmd::Status) => guard::status(),
+        Some(Cmd::Login { account }) => std::process::exit(guard::login(&account)),
+        Some(Cmd::Ui) => exit_on_err(ui::run()),
+        Some(Cmd::Statusline) => statusline(),
+        Some(Cmd::Install) => exit_on_err(install::run()),
+        Some(Cmd::Update) => exit_on_err(update::run()),
+    }
+}
+
+/// argv[0] shim check: a `claude` symlink pointing at this binary makes every
+/// plain `claude` launch route, no wrapper script needed. `claude_program()`
+/// already skips PATH entries that resolve back to us, so the real binary is
+/// still reachable.
+fn invoked_as_claude() -> bool {
+    env::args_os()
+        .next()
+        .map(PathBuf::from)
+        .as_deref()
+        .and_then(Path::file_name)
+        .is_some_and(|n| n == "claude")
+}
+
+/// cswap and claude live in ~/.local/bin, which GUI spawns (t3code) and the
+/// systemd user manager may leave off PATH. APPEND, never prepend: the
+/// caller's explicit PATH order (wrappers, pinned builds, test fakes) wins.
+/// Empty or relative entries are dropped: they mean "the current directory",
+/// and a `claude` shipped in a cloned repo must never be what runs.
+fn ensure_local_bin_on_path() {
+    let local_bin = cswap::home().join(".local/bin");
+    let path = env::var_os("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
+    let mut dirs: Vec<PathBuf> = env::split_paths(&path)
+        .filter(|p| p.is_absolute())
+        .collect();
+    if !dirs.contains(&local_bin) {
+        dirs.push(local_bin);
+    }
+    if let Ok(new) = env::join_paths(dirs) {
+        // SAFETY: top of main — no other threads yet.
+        unsafe { env::set_var("PATH", new) };
+    }
+}
+
+fn exit_on_err(result: anyhow::Result<()>) {
+    if let Err(e) = result {
+        eprintln!("ccflip: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+/// The directory to route by. bash silently resets an inherited PWD that no
+/// longer names the real cwd; match that — a stale PWD (t3code spawns with a
+/// cwd option that does not rewrite PWD) must not route to the wrong account.
+fn routing_dir() -> String {
+    if let Ok(pwd) = env::var("PWD")
+        && !pwd.is_empty()
+        && let (Ok(a), Ok(b)) = (std::fs::metadata(&pwd), std::fs::metadata("."))
+    {
+        use std::os::unix::fs::MetadataExt;
+        if a.dev() == b.dev() && a.ino() == b.ino() {
+            return pwd; // logical path (keeps symlinked spellings, like bash)
+        }
+    }
+    env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// The routing table from the module doc. Every arm execs and never returns.
+fn route(args: &[OsString]) -> ! {
+    let policy = policy::read();
+    // The launcher acts only on truly-dry windows, and treats a spend-billed
+    // account as dry near its cap so routing falls to the next tier before
+    // requests start failing.
+    let threshold = policy.knob("CCFLIP_THRESHOLD", 99.0);
+    let spend_threshold = policy.knob("CCFLIP_SPEND_THRESHOLD", 97.0);
+    // cswap missing or broken: fail open, plain claude.
+    let Some(list) = cswap::list() else {
+        launch::exec_claude(args)
+    };
+
+    if let Some(mapped) = cswap::mapped_email(&routing_dir()) {
+        if list
+            .by_email(&mapped)
+            .is_some_and(|a| select::serves_own(a, threshold, spend_threshold))
+        {
+            launch::go_subscription(None, args); // bare run resolves the mapping itself
+        }
+        // Pinned account is dry: any other enabled electable account may
+        // serve this dir (disabled accounts are dir-pinned only — never
+        // borrowed; unknown-health accounts are never a blind hand-off).
+        if let Some(alt) = select::pick_alt(&list, &mapped, threshold, spend_threshold) {
+            eprintln!("ccflip: {mapped} exhausted -> {}", alt.email);
+            launch::go_subscription(Some(&alt.email), args);
+        }
+        launch::go_bedrock(
+            "every usable subscription account exhausted",
+            args,
+            Some(&mapped),
+        );
+    }
+
+    // Unmapped dir: the default login, unless it is dead/dry. If another
+    // enabled account could replace it, launch anyway — the cswap-auto
+    // daemon moves the default login, not us.
+    let active_usable = list
+        .active_account()
+        .is_some_and(|a| select::usable(a, threshold, spend_threshold));
+    if active_usable || select::any_enabled_electable(&list, threshold, spend_threshold) {
+        launch::go_subscription(None, args);
+    }
+    launch::go_bedrock("no usable subscription account", args, None)
+}
+
+/// The account a config dir is logged into, by its live login rather than its
+/// (possibly stale) directory name; falls back to the name for a profile that
+/// has never been used.
+fn config_dir_account(dir: &str) -> String {
+    cswap::profile_email(Path::new(dir)).unwrap_or_else(|| {
+        Path::new(dir)
+            .file_name()
+            .map_or_else(|| "?".to_string(), |n| n.to_string_lossy().into_owned())
+    })
+}
+
+fn default_email() -> String {
+    cswap::profile_email(&cswap::home()).unwrap_or_else(|| "?".to_string())
+}
+
+/// Statusline chip: which "account" this session runs on. Designed to be
+/// chained after other statusline scripts (prints one word, no newline).
+/// bedrock | the pinned profile's account | default-login email
+fn statusline() {
+    // Account comes from env + files; the statusline JSON on stdin is unused.
+    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+    let account = if env::var("CLAUDE_CODE_USE_BEDROCK").is_ok_and(|v| !v.is_empty()) {
+        "bedrock".to_string()
+    } else if let Some(dir) = env::var("CLAUDE_CONFIG_DIR").ok().filter(|d| !d.is_empty()) {
+        config_dir_account(&dir)
+    } else {
+        default_email()
+    };
+    print!("⇄{account}");
+}
+
+/// `ccflip who` — which account is every running claude session on?
+fn who() {
+    let default_acct = default_email();
+    println!("{:<9} {:<45} CWD", "PID", "ACCOUNT");
+    for p in proc::claude_procs() {
+        let account = if p.bedrock {
+            "bedrock".to_string()
+        } else {
+            match &p.config_dir {
+                Some(dir) => config_dir_account(dir),
+                None => default_acct.clone(),
+            }
+        };
+        println!("{:<9} {account:<45} {}", p.pid, p.cwd);
+    }
+}
+
+/// Env override or default; a value that does not parse warns and defaults —
+/// never silently changes routing.
+pub fn env_parsed<T: std::str::FromStr + std::fmt::Display>(var: &str, default: T) -> T {
+    match env::var(var) {
+        Err(_) => default,
+        Ok(raw) => raw.parse().unwrap_or_else(|_| {
+            eprintln!("ccflip: {var}={raw} is not a number, using {default}");
+            default
+        }),
+    }
+}
+
+pub fn now() -> i64 {
+    jiff::Timestamp::now().as_second()
+}
+
+/// Local wall-clock HH:MM (journal lines, the UI).
+pub fn clock(epoch: i64) -> String {
+    jiff::Timestamp::from_second(epoch)
+        .map(|t| {
+            t.to_zoned(jiff::tz::TimeZone::system())
+                .strftime("%H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// An epoch second as the RFC 3339 stamp botocore writes (`…T12:00:00Z`).
+pub fn stamp(epoch: i64) -> Option<String> {
+    let t = jiff::Timestamp::from_second(epoch).ok()?;
+    Some(t.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
+/// An RFC 3339 stamp as an epoch second. Also takes the legacy AWS CLI
+/// cache spelling `…T12:00:00UTC`.
+pub fn epoch(stamp: &str) -> Option<i64> {
+    let stamp = stamp
+        .strip_suffix("UTC")
+        .map_or_else(|| stamp.to_string(), |s| format!("{s}Z"));
+    stamp.parse::<jiff::Timestamp>().ok().map(|t| t.as_second())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::epoch;
+
+    #[test]
+    fn epoch_reads_every_aws_cache_spelling() {
+        let z = epoch("2026-11-11T10:00:00Z").unwrap();
+        assert_eq!(epoch("2026-11-11T10:00:00UTC"), Some(z)); // legacy CLI
+        assert_eq!(epoch("2026-11-11T10:00:00.000Z"), Some(z)); // JS SDK
+        assert_eq!(epoch("2026-11-11T11:00:00+01:00"), Some(z));
+        assert_eq!(epoch("tomorrow"), None);
+        assert_eq!(super::stamp(z).as_deref(), Some("2026-11-11T10:00:00Z"));
+    }
+}

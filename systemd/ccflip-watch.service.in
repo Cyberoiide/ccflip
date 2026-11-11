@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/ccflip-watch
+ExecStart={exe} watch
 Restart=on-failure
 RestartSec=30
 
