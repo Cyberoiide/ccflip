@@ -156,7 +156,11 @@ esac
     }
 
     fn status(&self) -> Vec<serde_json::Value> {
-        serde_json::from_str(&self.ccflip(&["status"], &[])).unwrap()
+        self.status_with(&[])
+    }
+
+    fn status_with(&self, env: &[(&str, &str)]) -> Vec<serde_json::Value> {
+        serde_json::from_str(&self.ccflip(&["status"], env)).unwrap()
     }
 }
 
@@ -250,7 +254,9 @@ fn no_gcloud_installed_means_no_gcloud_accounts() {
         "{}",
     )
     .unwrap();
-    assert!(h.status().is_empty());
+    // Only the fakes on PATH: CI runners ship a real gcloud in /usr/bin.
+    let bin = h.path().join("bin");
+    assert!(h.status_with(&[("PATH", bin.to_str().unwrap())]).is_empty());
 }
 
 #[test]

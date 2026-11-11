@@ -233,6 +233,8 @@ esac
         &bin.join("systemd-run"),
         "#!/usr/bin/env bash\necho \"systemd-run $*\" >> \"$CALLS\"\n",
     );
+    // Shadows a real gcloud (CI runners ship one): AWS scenarios only.
+    write_exec(&bin.join("gcloud"), "#!/bin/sh\necho []\n");
     write_exec(
         &bin.join("notify-send"),
         "#!/usr/bin/env bash\necho \"notify-send $*\" >> \"$CALLS\"\n",
