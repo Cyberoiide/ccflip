@@ -121,6 +121,28 @@ used_recently() { # $1 = session name -> 0 + "acct ... minted HH:MM" if used
     return 1
 }
 
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/sso-guard"
+mkdir -p "$STATE"
+
+# A login that needs a human: one persistent notification, login on click.
+# Runs detached (its own transient unit) so waiting for the click never
+# blocks the other sessions. Dismissed = re-ask at most every 2 h.
+ask_login() { # $1 = session name
+    local unit="sso-guard-ask-$1" m="$STATE/$1.needs-you"
+    systemctl --user is-active --quiet "$unit" && return 0 # already asking
+    [[ -n "$(find "$m.dismissed" -mmin -120 2>/dev/null)" ]] && return 0
+    command -v notify-send >/dev/null 2>&1 || return 0
+    systemd-run --user --quiet --collect --unit "$unit" --setenv=PATH="$PATH" bash -c '
+        a=$(notify-send -u critical -t 0 -a sso-guard -A default="Log in" \
+            "AWS SSO: $1 expired" "Click to log in (browser)")
+        if [[ "$a" == default ]]; then
+            aws sso login --sso-session "$1" && rm -f "$2" "$2.dismissed"
+            systemctl --user start --no-block sso-guard.service
+        else
+            touch "$2.dismissed"
+        fi' _ "$1" "$m" && echo "sso-guard: $1 needs you, notification posted"
+}
+
 expiry_for() { # $1 = start_url -> newest expiresAt epoch (0 if none)
     local best=0 f exp e
     for f in "$HOME"/.aws/sso/cache/*.json; do
@@ -145,7 +167,10 @@ while IFS=$'\t' read -r name url profile; do
     e=$(expiry_for "$url")
     # +90s slack: the re-arm wakes 60s before the threshold, so act now
     # instead of sleeping 1 more minute and waking again.
-    if (( e - now > MIN_SECONDS + 90 )); then track "$e"; continue; fi
+    if (( e - now > MIN_SECONDS + 90 )); then
+        rm -f "$STATE/$name.needs-you" "$STATE/$name.needs-you.dismissed"
+        track "$e"; continue
+    fi
 
     # Sessions outside the allowlist are only worth keeping while something
     # uses them. Decide before spending a refresh call on a dead one.
@@ -183,12 +208,18 @@ while IFS=$'\t' read -r name url profile; do
     fi
 
     if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
-        command -v notify-send >/dev/null 2>&1 && \
-            notify-send -u critical "sso-guard" "AWS SSO session '$name' expired — complete the login in the browser"
+        # One click-free browser attempt. If it times out, the browser IdP
+        # session is gone too and a human is needed: ask once via a
+        # notification instead of opening a new tab on every run.
+        if [[ -e "$STATE/$name.needs-you" ]]; then
+            ask_login "$name"; continue
+        fi
         if aws sso login --sso-session "$name"; then
             track "$(expiry_for "$url")"
         else
-            rc=1
+            echo "sso-guard: $name browser login timed out, asking via notification instead of reopening the browser"
+            touch "$STATE/$name.needs-you"
+            ask_login "$name"
         fi
     else
         echo "sso-guard: '$name' needs interactive login (no display): aws sso login --sso-session $name" >&2
