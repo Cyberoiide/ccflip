@@ -14,7 +14,8 @@ One static Rust binary, nine subcommands:
 | `ccflip budget` | real dollar meters + this host's Bedrock consumption |
 | `ccflip who` | account of every running claude session (PID, account, cwd) |
 | `ccflip watch` | rotation, mid-session tier switching, policy guard, alerts (systemd unit) |
-| `ccflip sso-guard` | keep AWS SSO sessions fresh (systemd, adaptive) |
+| `ccflip sso-guard` | keep AWS SSO / gcloud credentials fresh (systemd, adaptive) |
+| `ccflip status` | every guarded account (AWS SSO, gcloud) and its state, as JSON |
 | `ccflip statusline` | print the account chip for the statusline |
 | `ccflip install` | claude-swap + systemd units on this host |
 | `ccflip update` | replace itself with the latest GitHub release |
@@ -221,11 +222,29 @@ A flag is only raised by a line Claude Code marked as an API error
 Matching the phrase alone would fire on any session that merely *discusses*
 limits and push healthy work onto the paid tier for nothing.
 
-## SSO freshness (hosts using an AWS profile)
+## Credential keep-alive: AWS SSO, gcloud
 
-`ccflip sso-guard` keeps every AWS IAM Identity Center session in
-`~/.aws/config` alive so the Bedrock tier never dies with "Token is expired".
-Each run, per `[sso-session]` some profile uses:
+`ccflip sso-guard` keeps cloud CLI credentials alive so the Bedrock tier (and
+kubectl, tunnels, gcloud…) never dies with "Token is expired". Each provider
+is a module behind one small trait (`src/guard.rs`); adding one = one module
+plus one line in `PROVIDERS`.
+
+`ccflip status` prints every account as JSON — the contract a UI will read:
+
+```json
+[{ "provider": "aws", "account": "heka", "state": "ok",
+   "expires_at": "2026-11-11T18:00:00Z", "needs_you": false },
+ { "provider": "gcloud", "account": "me@example.com", "state": "expired",
+   "needs_you": true }]
+```
+
+`state` is `ok`, `expiring` (renewed on the next run), `expired` or `error`
+(could not tell; retried). `needs_you`: a login only a human can finish is
+pending, and a notification is up.
+
+### AWS IAM Identity Center
+
+Per `[sso-session]` in `~/.aws/config` that some profile uses:
 
 1. Token healthy: nothing; the next run is armed ~1 min before it drops under
    `SSO_GUARD_MIN_MINUTES` (default 15).
@@ -242,16 +261,35 @@ which sessions may log in on their own. The others are kept alive silently
 and re-logged only while something uses them: a process with
 `--profile P` / `AWS_PROFILE=P`, or role credentials minted for one of its
 accounts in the last 65 min. Unused, they lapse quietly — log in on demand.
+It never changes Identity Center settings: session length is the org's policy.
 
-Scheduling: a oneshot `sso-guard.service`, re-armed adaptively through a
-transient `sso-guard-next` timer; the hourly `sso-guard.timer` is only the
-reboot-safe backstop, and disabling it (`sso-off`) stops everything. Set
-knobs in a drop-in: `systemctl --user edit sso-guard.service` →
-`[Service]` / `Environment=SSO_GUARD_BROWSER=heka`. `ccflip install` enables
-it only where `~/.aws/config` exists — instance-role hosts have nothing to
-guard. It never changes Identity Center settings (session length is the org's
-policy). Claude Code's own `awsAuthRefresh` setting stays as the in-session
-belt.
+### gcloud
+
+Every `gcloud auth list` account, plus application-default credentials when
+`application_default_credentials.json` exists. gcloud renews its own access
+tokens from a long-lived refresh token, so there is nothing to renew ahead;
+each run asks gcloud for a token and notices a refresh token that died
+(revoked, password change, Workspace session control). For the active account
+and ADC that posts the same "click to log in" notification; other accounts are
+only reported. It never opens a browser unasked, and a network failure never
+bothers you.
+
+### Knobs and scheduling
+
+Knobs live in `~/.config/ccflip/policy.env` (the environment still wins), so
+reinstalling the units never loses them:
+
+```bash
+SSO_GUARD_BROWSER=heka
+SSO_GUARD_MIN_MINUTES=15
+```
+
+A oneshot `sso-guard.service`, re-armed adaptively through a transient
+`sso-guard-next` timer; the hourly `sso-guard.timer` is the reboot-safe
+backstop and gcloud's poll. Disabling it (`sso-off`) stops everything.
+`ccflip install` enables it only where `~/.aws/config` exists — instance-role
+hosts have nothing to guard. Claude Code's own `awsAuthRefresh` setting stays
+as the in-session belt.
 
 ## Gotchas
 

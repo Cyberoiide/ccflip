@@ -49,6 +49,15 @@ impl Policy {
         }
     }
 
+    /// Text knob: the environment wins, then policy.env. Empty = unset, as
+    /// the shell's `${VAR:-default}` the bash tools used.
+    pub fn text(&self, key: &str) -> Option<String> {
+        env::var(key)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| self.get(key).filter(|v| !v.is_empty()))
+    }
+
     /// (pinned-only accounts, the account the default login is forced back to).
     pub fn containment(&self) -> Option<(Vec<String>, Option<String>)> {
         let raw = self.get("CCFLIP_PINNED_ONLY")?;

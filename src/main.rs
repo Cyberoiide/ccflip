@@ -38,7 +38,8 @@ usage: ccflip [--] [claude args…]   route to the right account and launch
        ccflip who                   account of every running claude session
        ccflip budget                dollar meters + this host's Bedrock use
        ccflip watch                 pinned-session rotation, policy, alerts
-       ccflip sso-guard             keep AWS SSO sessions fresh (systemd)
+       ccflip sso-guard             keep AWS SSO / gcloud credentials fresh (systemd)
+       ccflip status                every guarded account and its state (JSON)
        ccflip statusline            print the account chip (statusline hook)
        ccflip install               systemd units + claude-swap on this host
        ccflip update                self-update from the latest GitHub release
@@ -82,6 +83,7 @@ fn main() {
             Some("budget") => return budget::run(),
             Some("watch") => watch::run(),
             Some("sso-guard") => std::process::exit(guard::run()),
+            Some("status") => return guard::status(),
             Some("statusline") => return statusline(),
             Some("install") => return exit_on_err(install::run()),
             Some("update") => return exit_on_err(update::run()),
@@ -265,6 +267,12 @@ pub fn now() -> i64 {
     jiff::Timestamp::now().as_second()
 }
 
+/// An epoch second as the RFC 3339 stamp botocore writes (`…T12:00:00Z`).
+pub fn stamp(epoch: i64) -> Option<String> {
+    let t = jiff::Timestamp::from_second(epoch).ok()?;
+    Some(t.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
 /// An RFC 3339 stamp as an epoch second. Also takes the legacy AWS CLI
 /// cache spelling `…T12:00:00UTC`.
 pub fn epoch(stamp: &str) -> Option<i64> {
@@ -285,5 +293,6 @@ mod tests {
         assert_eq!(epoch("2026-11-11T10:00:00.000Z"), Some(z)); // JS SDK
         assert_eq!(epoch("2026-11-11T11:00:00+01:00"), Some(z));
         assert_eq!(epoch("tomorrow"), None);
+        assert_eq!(super::stamp(z).as_deref(), Some("2026-11-11T10:00:00Z"));
     }
 }

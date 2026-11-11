@@ -65,9 +65,9 @@ pub fn run() -> Result<()> {
         "cswap-auto.service",
         "ccflip-watch.service",
     ])?;
-    // SSO freshness is only meaningful where an AWS profile is configured;
-    // instance-role hosts have no sso-session to guard.
-    if cswap::home().join(".aws/config").exists() {
+    // Only meaningful where there is something to guard: instance-role hosts
+    // have no sso-session, and no gcloud means no gcloud accounts.
+    if cswap::home().join(".aws/config").exists() || crate::guard::on_path("gcloud") {
         systemctl(&["enable", "--now", "sso-guard.timer"])?;
     }
 

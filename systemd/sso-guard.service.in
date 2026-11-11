@@ -1,5 +1,5 @@
 [Unit]
-Description=Keep the AWS SSO session fresh for Bedrock
+Description=Keep AWS SSO / gcloud credentials fresh (ccflip sso-guard)
 
 [Service]
 Type=oneshot

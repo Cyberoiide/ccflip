@@ -18,8 +18,10 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{Run, ask_login, clear_needs_you, needs_you};
-use crate::{cswap, epoch, now};
+use super::{Account, Provider, Run, ask_login, clear_needs_you, needs_you};
+use crate::{cswap, epoch, now, stamp};
+
+pub struct Aws;
 
 struct Profile {
     name: String,
@@ -93,30 +95,77 @@ fn sessions(config: &str) -> Vec<Session> {
     out
 }
 
-pub fn check(run: &mut Run) {
+/// No AWS config = nothing to guard (instance-role host).
+fn configured_sessions() -> Vec<Session> {
     let config = env::var_os("AWS_CONFIG_FILE")
         .filter(|v| !v.is_empty())
         .map_or_else(|| cswap::home().join(".aws/config"), PathBuf::from);
-    let Ok(config) = fs::read_to_string(config) else {
-        return; // no AWS config = nothing to guard (instance-role host)
-    };
+    fs::read_to_string(config).map_or_else(|_| Vec::new(), |c| sessions(&c))
+}
+
+fn cache_dir() -> PathBuf {
+    cswap::home().join(".aws/sso/cache")
+}
+
+impl Provider for Aws {
+    fn id(&self) -> &'static str {
+        "aws"
+    }
+
+    fn label(&self) -> &'static str {
+        "AWS SSO"
+    }
+
+    fn check(&self, run: &mut Run) {
+        check(self, run);
+    }
+
+    fn status(&self, run: &Run) -> Vec<Account> {
+        let cache = cache_dir();
+        configured_sessions()
+            .into_iter()
+            .map(|s| {
+                let e = expiry_for(&cache, &s.start_url);
+                Account {
+                    provider: self.id(),
+                    state: run.state(e),
+                    expires_at: (e > 0).then(|| stamp(e)).flatten(),
+                    needs_you: needs_you(self, &s.name).exists(),
+                    account: s.name,
+                }
+            })
+            .collect()
+    }
+
+    fn login(&self, session: &str) -> bool {
+        Command::new("aws")
+            .args(["sso", "login", "--sso-session", session])
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+}
+
+fn check(aws: &Aws, run: &mut Run) {
     // Sessions allowed to open a browser login when their IdC session ends
     // (space-separated; "*" = all). Others are re-logged only while in use:
     // an org that caps sessions at 1h would otherwise mean a login per hour
     // for a session nothing needs.
-    let browser = env::var("SSO_GUARD_BROWSER").unwrap_or_else(|_| "*".to_string());
+    let browser = run
+        .policy
+        .text("SSO_GUARD_BROWSER")
+        .unwrap_or_else(|| "*".to_string());
     let graphical = ["WAYLAND_DISPLAY", "DISPLAY"]
         .iter()
         .any(|v| env::var_os(v).is_some_and(|x| !x.is_empty()));
-    let cache = cswap::home().join(".aws/sso/cache");
+    let cache = cache_dir();
 
-    for s in sessions(&config) {
+    for s in configured_sessions() {
         let name = s.name.as_str();
         let e = expiry_for(&cache, &s.start_url);
         // +90s slack: the re-arm wakes 60s before the threshold, so act now
         // instead of sleeping 1 more minute and waking again.
         if e - run.now > run.min_seconds + 90 {
-            clear_needs_you(name);
+            clear_needs_you(aws, name);
             run.track(e);
             continue;
         }
@@ -165,9 +214,9 @@ pub fn check(run: &mut Run) {
                 "sso-guard: '{name}' needs interactive login (no display): aws sso login --sso-session {name}"
             );
             run.failed = true;
-        } else if needs_you(name).exists() {
-            ask_login(name);
-        } else if login(name) {
+        } else if needs_you(aws, name).exists() {
+            ask_login(aws, name);
+        } else if aws.login(name) {
             // One click-free browser attempt worked.
             run.track(expiry_for(&cache, &s.start_url));
         } else {
@@ -176,17 +225,10 @@ pub fn check(run: &mut Run) {
             println!(
                 "sso-guard: {name} browser login timed out, asking via notification instead of reopening the browser"
             );
-            let _ = fs::write(needs_you(name), "");
-            ask_login(name);
+            let _ = fs::write(needs_you(aws, name), "");
+            ask_login(aws, name);
         }
     }
-}
-
-pub fn login(session: &str) -> bool {
-    Command::new("aws")
-        .args(["sso", "login", "--sso-session", session])
-        .status()
-        .is_ok_and(|s| s.success())
 }
 
 fn cache_entries(cache: &Path) -> Vec<(PathBuf, Value)> {
@@ -226,14 +268,14 @@ fn refresh(cache: &Path, start_url: &str) -> bool {
             let Some(expires_in) = r["expiresIn"].as_i64() else {
                 return false;
             };
-            let Ok(expires_at) = jiff::Timestamp::from_second(now() + expires_in) else {
+            let Some(expires_at) = stamp(now() + expires_in) else {
                 return false;
             };
             v["accessToken"] = r["accessToken"].clone();
             if r["refreshToken"].is_string() {
                 v["refreshToken"] = r["refreshToken"].clone();
             }
-            v["expiresAt"] = expires_at.strftime("%Y-%m-%dT%H:%M:%SZ").to_string().into();
+            v["expiresAt"] = expires_at.into();
             write_private(&path, v.to_string().as_bytes()).is_ok()
         })
 }

@@ -14,19 +14,28 @@ case by case against the bash versions (see Testing).
   leading `export` is accepted) instead of being sourced by a shell.
 - Install via `cargo binstall` or a GitHub release; `ccflip install` writes the
   systemd units pointing at the binary. `sso-guard.service` is now
-  `ExecStart=<binary> sso-guard`: hand-written units must be updated, and
-  per-host knobs (`SSO_GUARD_BROWSER`, `SSO_GUARD_MIN_MINUTES`) belong in a
-  drop-in (`systemctl --user edit sso-guard.service`) so reinstalling keeps
-  them.
+  `ExecStart=<binary> sso-guard`: hand-written units must be updated.
+- Per-host sso-guard knobs (`SSO_GUARD_BROWSER`, `SSO_GUARD_MIN_MINUTES`)
+  move to `~/.config/ccflip/policy.env` (the environment still wins), so
+  reinstalling the units keeps them.
+- sso-guard state markers are named `<provider>.<account>.needs-you`
+  (`aws.heka.needs-you`); an old `heka.needs-you` is ignored, costing at most
+  one extra click-free browser try.
 - The `claude` shim is a symlink to the binary (`ln -sf "$(command -v ccflip)"
   ~/.local/bin/claude`) instead of a script.
 
-### sso-guard
+### Credential keep-alive (sso-guard)
 
-- Same decisions as the bash version (silent refresh, capped-session sleep,
-  in-use gating, one browser try then one notification), now in
-  `src/guard.rs` (scheduling, notifications) + `src/guard/aws.rs` (Identity
-  Center). Other providers (gcloud next) slot in as sibling modules.
+- A provider framework: `src/guard.rs` holds the `Provider` trait (`check`,
+  `status`, `login`), scheduling and the human-login notification; each
+  provider is one module listed in `PROVIDERS`.
+- AWS Identity Center (`src/guard/aws.rs`): same decisions as the bash
+  version (silent refresh, capped-session sleep, in-use gating, one browser
+  try then one notification).
+- gcloud (`src/guard/gcloud.rs`): every `gcloud auth list` account plus
+  application-default credentials; a dead refresh token posts the login
+  notification for the active account and ADC, never a browser unasked.
+- `ccflip status`: every account's state as JSON, the contract for a UI.
 - The refresh token is redeemed with a direct HTTPS call instead of
   `aws sso-oidc create-token`: the refresh token and client secret no longer
   appear in a command line any local user can read from `/proc`, and a run
@@ -47,8 +56,8 @@ case by case against the bash versions (see Testing).
   routing/watcher/sso-guard runs against fakes. `SSO_GUARD_ORACLE=<old
   bin/sso-guard> cargo test --test sso_guard` replays every sso-guard
   scenario against the bash version and fails on any differing decision.
-- `cargo test -- --ignored`: the real AWS CLI reading the token cache we
-  write, and the tier switcher signalling real processes (run it in a PID
+- `cargo test -- --ignored`: the real gcloud CLI's dead/offline errors, the
+  real AWS CLI reading the token cache we write, and the tier switcher signalling real processes (run it in a PID
   namespace: `unshare -rpf --mount-proc cargo test -- --ignored`).
 
 ## v1.0.0 — 2026-09-06

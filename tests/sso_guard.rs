@@ -205,8 +205,10 @@ fn run_one(s: &Scenario, program: &[&str], extra_env: &[(&str, &str)]) -> Outcom
         ),
     )
     .unwrap();
+    // The bash version named markers by session; ccflip by provider.session.
+    let prefix = if program[0] == "bash" { "" } else { "aws." };
     for m in s.markers {
-        fs::write(state.join(format!("sg-a.{m}")), "").unwrap();
+        fs::write(state.join(format!("{prefix}sg-a.{m}")), "").unwrap();
     }
     if let Some(acct) = s.minted_for {
         fs::write(
@@ -280,7 +282,10 @@ esac
     let cached: serde_json::Value = serde_json::from_slice(&fs::read(&token).unwrap()).unwrap();
     let mut markers: Vec<String> = fs::read_dir(&state)
         .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .map(|e| {
+            let name = e.unwrap().file_name().into_string().unwrap();
+            name.strip_prefix(prefix).unwrap_or(&name).to_string()
+        })
         .collect();
     markers.sort();
     let mut lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
@@ -295,7 +300,10 @@ esac
         refresh_calls: seen.lock().unwrap().len()
             + calls.matches("aws sso-oidc create-token").count(),
         logins: calls.matches("aws sso login --sso-session sg-a").count(),
-        asks: calls.matches("--unit sso-guard-ask-sg-a").count(),
+        asks: calls
+            .lines()
+            .filter(|l| l.contains("--unit sso-guard-ask-") && l.contains("sg-a"))
+            .count(),
         rearm: calls.lines().find_map(|l| {
             l.split_whitespace()
                 .find_map(|w| w.strip_prefix("--on-active="))
@@ -441,6 +449,16 @@ fn gated_unused_session_lapses_once_its_idc_session_is_over() {
         "{o:#?}"
     );
     assert_eq!((o.refresh_calls, o.logins), (1, 0));
+}
+
+#[test]
+fn empty_browser_allowlist_means_all_like_bash() {
+    let o = run(Scenario {
+        left: -60,
+        browser: Some(""),
+        ..Default::default()
+    });
+    assert_eq!(o.logins, 1, "{o:#?}");
 }
 
 #[test]
@@ -669,7 +687,7 @@ fn ask_flow_click_logs_in_and_dismiss_marks() {
         let home = t.path();
         let state = home.join("state/sso-guard");
         fs::create_dir_all(&state).unwrap();
-        fs::write(state.join("sg-a.needs-you"), "").unwrap();
+        fs::write(state.join("aws.sg-a.needs-you"), "").unwrap();
         let bin = home.join("bin");
         fs::create_dir_all(&bin).unwrap();
         let calls = home.join("calls");
@@ -690,7 +708,7 @@ fn ask_flow_click_logs_in_and_dismiss_marks() {
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .env("XDG_STATE_HOME", home.join("state"))
             .env("CALLS", &calls)
-            .env("SSO_GUARD_ASK", "sg-a")
+            .env("SSO_GUARD_ASK", "aws.sg-a")
             .status()
             .unwrap();
         assert!(status.success());
@@ -708,7 +726,7 @@ fn ask_flow_click_logs_in_and_dismiss_marks() {
             assert!(markers.is_empty(), "{markers:?}");
         } else {
             assert!(!calls.contains("aws sso login"), "{calls}");
-            assert!(markers.contains_key("sg-a.needs-you.dismissed"));
+            assert!(markers.contains_key("aws.sg-a.needs-you.dismissed"));
         }
     }
 }

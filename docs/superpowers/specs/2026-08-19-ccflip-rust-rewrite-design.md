@@ -40,19 +40,26 @@ sourced by a shell.
 - `src/install.rs` — claude-swap bootstrap, systemd units (embedded;
   ExecStart points at `current_exe()`)
 - `src/update.rs` — self-update from GitHub releases
-- `src/guard.rs` — `ccflip sso-guard`: provider-agnostic on/off switch,
-  adaptive re-arm, "a human is needed" notification
-- `src/guard/aws.rs` — the AWS Identity Center provider (2026-11-11 port of
-  the bash version's final design)
+- `src/guard.rs` — `ccflip sso-guard` / `ccflip status`: the `Provider`
+  trait, on/off switch, adaptive re-arm, "a human is needed" notification
+- `src/guard/aws.rs`, `src/guard/gcloud.rs` — the providers
 
-## Credential providers (planned: gcloud)
+## Credential providers
 
-sso-guard is meant to keep more than AWS alive. A provider is a sibling
-module of `guard/aws.rs` with one `check(&mut Run)` called from
-`guard::run`: it reports wake-ups (`Run::track`/`Run::want`), failures
-(`Run::failed`) and human logins (`Run::ask_login`). gcloud is next; no
-trait until a second provider shows what is truly shared. A UI (tray,
-dashboard) comes after and reads the same state.
+`src/guard.rs` defines `Provider` (`id`, `label`, `check`, `status`,
+`login`) and the `PROVIDERS` list; `ccflip sso-guard` runs every
+`check`, `ccflip status` prints every `status` as JSON. Shared services:
+`Run` (clock, policy knobs, wake-up, exit code), `ask_login` (one
+persistent notification per account, re-entering the binary via
+`SSO_GUARD_ASK=<provider>.<account>`), state markers.
+
+- `aws`: IAM Identity Center, ported from bash and parity-tested against it.
+- `gcloud`: probes `gcloud auth print-access-token` per account (and ADC);
+  stderr naming the login command = dead credentials, anything else =
+  transient error. Classification checked against real gcloud 593 output.
+
+A UI (tray icon, dashboard) is next: it reads `ccflip status` and triggers
+logins the same way the notification does.
 
 ## Behavior parity notes
 
@@ -76,4 +83,6 @@ dashboard) comes after and reads the same state.
   OIDC server and fake `aws`/`systemctl`/`systemd-run`/`notify-send`. With
   `SSO_GUARD_ORACLE=<old bin/sso-guard>` each scenario also runs the bash
   version and must reach identical decisions.
+- `tests/accounts.rs`: `ccflip status`, the gcloud provider against a fake
+  `gcloud`, knobs from policy.env; an ignored test runs the real gcloud CLI.
 - CI (`ci.yml`): fmt, clippy `-D warnings`, tests on every push/PR.
