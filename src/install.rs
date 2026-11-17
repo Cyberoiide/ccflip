@@ -85,6 +85,9 @@ ccflip installed. Remaining manual steps:
      binary in every environment. For spawners that ignore that setting,
      shim `claude` instead — ccflip routes when invoked under that name:
        ln -sf {exe} ~/.local/bin/claude    (must precede the real binary)
+  3d. AWS SSO on demand: shim `aws` the same way, and an expired session
+     logs in by itself on the next call (kubectl, ssm, scripts):
+       ln -sf {exe} ~/.local/bin/aws       (must precede the real aws)
   4. Optional statusline, in ~/.claude/settings.json:
        \"statusLine\": {{ \"type\": \"command\", \"command\": \"{exe} statusline\" }}
   5. Launch with `ccflip` in terminals; t3code needs nothing.",

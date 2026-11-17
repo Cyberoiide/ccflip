@@ -124,6 +124,10 @@ struct Scenario {
     minted_for: Option<&'static str>,
     tz: &'static str,
     profile: &'static str,
+    /// Copies of the program started at once (the shim's lock).
+    parallel: usize,
+    /// PATH entries ahead of the fakes (another shim).
+    path_prefix: Option<std::path::PathBuf>,
 }
 
 impl Default for Scenario {
@@ -139,6 +143,8 @@ impl Default for Scenario {
             minted_for: None,
             tz: "Europe/Paris",
             profile: "sg-a-prof",
+            parallel: 1,
+            path_prefix: None,
         }
     }
 }
@@ -156,6 +162,8 @@ struct Outcome {
     access_token: String,
     expires_at: i64,
     markers: Vec<String>,
+    /// Every call that reached the fakes, in order.
+    calls: String,
 }
 
 fn approx(a: i64, b: i64) -> bool {
@@ -248,6 +256,7 @@ echo "aws $*" >> "$CALLS"
 case "$1 $2" in
   "sso-oidc create-token") [[ "$OIDC_STATUS" == 200 ]] && printf '%s' "$OIDC_BODY" || exit 254 ;;
   "sso login")
+    sleep "${LOGIN_SLEEP:-0}"
     [[ "$LOGIN_RC" == 0 ]] || exit 1
     jq --arg e "$(date -u -d +28800sec +%FT%TZ)" '.accessToken = "login" | .expiresAt = $e' \
        "$HOME/.aws/sso/cache/tok.json" > "$HOME/t.json" && mv "$HOME/t.json" "$HOME/.aws/sso/cache/tok.json" ;;
@@ -260,7 +269,16 @@ esac
     cmd.args(&program[1..])
         .env_clear()
         .env("HOME", t)
-        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env(
+            "PATH",
+            format!(
+                "{}{}:/usr/bin:/bin",
+                s.path_prefix
+                    .as_ref()
+                    .map_or(String::new(), |p| format!("{}:", p.display())),
+                bin.display()
+            ),
+        )
         .env("TZ", s.tz)
         .env("XDG_STATE_HOME", t.join("state"))
         .env("CALLS", &calls)
@@ -278,7 +296,11 @@ esac
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
+    let others: Vec<Child> = (1..s.parallel).map(|_| cmd.spawn().unwrap()).collect();
     let out = cmd.output().unwrap();
+    for mut c in others {
+        assert!(c.wait().unwrap().success());
+    }
 
     let calls = fs::read_to_string(&calls).unwrap_or_default();
     let cached: serde_json::Value = serde_json::from_slice(&fs::read(&token).unwrap()).unwrap();
@@ -288,6 +310,7 @@ esac
             let name = e.unwrap().file_name().into_string().unwrap();
             name.strip_prefix(prefix).unwrap_or(&name).to_string()
         })
+        .filter(|m| !m.ends_with(".lock")) // the login lock, not a marker
         .collect();
     markers.sort();
     let mut lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
@@ -314,6 +337,7 @@ esac
         access_token: cached["accessToken"].as_str().unwrap().to_string(),
         expires_at: epoch(cached["expiresAt"].as_str().unwrap()),
         markers,
+        calls,
     }
 }
 
@@ -817,4 +841,126 @@ fn botocore_accepts_the_cache_we_write() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(bearer.join().unwrap(), "fresh");
+}
+
+/// `ccflip` symlinked as `aws`, the fake aws behind it on PATH as the real one.
+fn shim(s: Scenario, args: &[&str], extra_env: &[(&str, &str)]) -> Outcome {
+    let d = tempfile::tempdir().unwrap();
+    let aws = d.path().join("aws");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ccflip"), &aws).unwrap();
+    let mut program = vec![aws.to_str().unwrap()];
+    program.extend_from_slice(args);
+    run_one(&s, &program, extra_env)
+}
+
+#[test]
+fn shim_passes_a_live_token_straight_through() {
+    let o = shim(
+        Scenario {
+            profile: "sg-shim-live",
+            ..Default::default()
+        },
+        &["--profile", "sg-shim-live", "sts", "get-caller-identity"],
+        &[],
+    );
+    assert_eq!(
+        o.calls,
+        "aws --profile sg-shim-live sts get-caller-identity\n"
+    );
+    assert_eq!((o.rc, o.refresh_calls, o.logins), (0, 0, 0));
+}
+
+#[test]
+fn shim_refreshes_an_expired_token_before_the_call() {
+    let s = Scenario {
+        profile: "sg-shim-refresh",
+        left: -300,
+        oidc: ok_token(3600),
+        ..Default::default()
+    };
+    let o = shim(s, &["s3", "ls"], &[("AWS_PROFILE", "sg-shim-refresh")]);
+    assert_eq!(
+        (o.refresh_calls, o.logins, o.access_token.as_str()),
+        (1, 0, "fresh")
+    );
+    assert!(o.calls.ends_with("aws s3 ls\n"), "{}", o.calls);
+}
+
+#[test]
+fn shim_logs_in_once_when_the_session_is_over_then_runs_the_call() {
+    let s = Scenario {
+        profile: "sg-shim-login",
+        left: -300,
+        ..Default::default()
+    };
+    let o = shim(s, &["--profile", "sg-shim-login", "eks", "get-token"], &[]);
+    assert_eq!((o.rc, o.logins, o.access_token.as_str()), (0, 1, "login"));
+    let order: Vec<&str> = o.calls.lines().collect();
+    assert_eq!(
+        order,
+        [
+            "systemctl --user --quiet is-enabled sso-guard.timer",
+            "aws sso login --sso-session sg-a",
+            "aws --profile sg-shim-login eks get-token"
+        ]
+    );
+}
+
+#[test]
+fn shim_parallel_callers_share_one_login() {
+    let s = Scenario {
+        profile: "sg-shim-par",
+        left: -300,
+        parallel: 3,
+        ..Default::default()
+    };
+    let o = shim(
+        s,
+        &["--profile", "sg-shim-par", "eks", "get-token"],
+        &[("LOGIN_SLEEP", "1")],
+    );
+    assert_eq!(o.logins, 1, "{}", o.calls);
+    assert_eq!(
+        o.calls
+            .matches("aws --profile sg-shim-par eks get-token")
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn shim_without_display_or_when_off_only_runs_the_call() {
+    for s in [
+        Scenario {
+            profile: "sg-shim-off",
+            left: -300,
+            graphical: false,
+            ..Default::default()
+        },
+        Scenario {
+            profile: "sg-shim-off",
+            left: -300,
+            timer_enabled: false,
+            ..Default::default()
+        },
+    ] {
+        let o = shim(s, &["--profile", "sg-shim-off", "s3", "ls"], &[]);
+        assert_eq!((o.logins, o.rc), (0, 0), "{}", o.calls);
+        assert!(o.calls.ends_with("aws --profile sg-shim-off s3 ls\n"));
+    }
+}
+
+#[test]
+fn shim_never_ping_pongs_with_another_shim_on_path() {
+    // A second ccflip (another canonical path) as `aws` ahead of the real one.
+    let other = tempfile::tempdir().unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_ccflip"), other.path().join("aws")).unwrap();
+    let s = Scenario {
+        profile: "sg-shim-pingpong",
+        path_prefix: Some(other.path().to_path_buf()),
+        ..Default::default()
+    };
+    let o = shim(s, &["--profile", "sg-shim-pingpong", "s3", "ls"], &[]);
+    assert_eq!(o.rc, 0, "{}", o.calls);
+    assert!(o.calls.ends_with("aws --profile sg-shim-pingpong s3 ls\n"));
 }

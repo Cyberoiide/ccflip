@@ -9,17 +9,18 @@
 
 use std::collections::HashSet;
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use super::{Account, Provider, Run, ask_login, clear_needs_you, needs_you};
+use super::{Account, Provider, Run, ask_login, clear_needs_you, lock_file, needs_you};
 use crate::{clock, cswap, epoch, now, stamp};
 
 pub struct Aws;
@@ -98,10 +99,13 @@ fn sessions(config: &str) -> Vec<Session> {
 
 /// No AWS config = nothing to guard (instance-role host).
 fn configured_sessions() -> Vec<Session> {
-    let config = env::var_os("AWS_CONFIG_FILE")
+    fs::read_to_string(config_path()).map_or_else(|_| Vec::new(), |c| sessions(&c))
+}
+
+fn config_path() -> PathBuf {
+    env::var_os("AWS_CONFIG_FILE")
         .filter(|v| !v.is_empty())
-        .map_or_else(|| cswap::home().join(".aws/config"), PathBuf::from);
-    fs::read_to_string(config).map_or_else(|_| Vec::new(), |c| sessions(&c))
+        .map_or_else(|| cswap::home().join(".aws/config"), PathBuf::from)
 }
 
 fn cache_dir() -> PathBuf {
@@ -155,9 +159,7 @@ fn check(aws: &Aws, run: &mut Run) {
         .policy
         .text("SSO_GUARD_BROWSER")
         .unwrap_or_else(|| "*".to_string());
-    let graphical = ["WAYLAND_DISPLAY", "DISPLAY"]
-        .iter()
-        .any(|v| env::var_os(v).is_some_and(|x| !x.is_empty()));
+    let graphical = graphical();
     let cache = cache_dir();
 
     for s in configured_sessions() {
@@ -217,19 +219,137 @@ fn check(aws: &Aws, run: &mut Run) {
             run.failed = true;
         } else if needs_you(aws, name).exists() {
             ask_login(aws, name);
-        } else if aws.login(name) {
-            // One click-free browser attempt worked.
-            run.track(expiry_for(&cache, &s.start_url));
         } else {
-            // Timed out: the browser IdP session is gone too. Ask once via a
-            // notification instead of opening a new tab on every run.
-            println!(
-                "sso-guard: {name} browser login timed out, asking via notification instead of reopening the browser"
-            );
-            let _ = fs::write(needs_you(aws, name), "");
-            ask_login(aws, name);
+            // Held through the login: an on-demand caller waits for it
+            // instead of opening a second tab.
+            let lock = lock_file(aws, name);
+            if lock.as_ref().is_some_and(|l| l.try_lock().is_err()) {
+                println!("sso-guard: {name} login already in progress (aws shim)");
+                run.want(run.now + 120);
+            } else if aws.login(name) {
+                // One click-free browser attempt worked.
+                run.track(expiry_for(&cache, &s.start_url));
+            } else {
+                // Timed out: the browser IdP session is gone too. Ask once via
+                // a notification instead of opening a new tab on every run.
+                println!(
+                    "sso-guard: {name} browser login timed out, asking via notification instead of reopening the browser"
+                );
+                let _ = fs::write(needs_you(aws, name), "");
+                ask_login(aws, name);
+            }
         }
     }
+}
+
+/// `aws` shim (ccflip symlinked as `aws`, ahead of the real one on PATH).
+/// A session outside `SSO_GUARD_BROWSER` lapses while unused — after every
+/// break, under a 1h IdC cap. So when this call's profile belongs to an
+/// sso-session whose token has expired, [`ensure`] it first; then the real
+/// aws runs. Covers whatever spawns `aws` from a shell PATH: kubectl's
+/// `aws eks get-token`, ssm tunnels, scripts.
+pub fn shim(args: &[OsString]) -> ! {
+    // Every shim already on this call's chain is skipped, not just us: two
+    // shims in different PATH dirs (bash + ccflip mid-migration) would
+    // otherwise exec each other forever.
+    let mut chain: Vec<PathBuf> = env::var_os("AWS_SHIM_SEEN")
+        .map(|v| env::split_paths(&v).collect())
+        .unwrap_or_default();
+    let real = crate::launch::real_program_skipping("aws", &chain);
+    chain.extend(
+        env::current_exe()
+            .ok()
+            .and_then(|p| fs::canonicalize(p).ok()),
+    );
+
+    let config = fs::read_to_string(config_path()).unwrap_or_default();
+    let env_profile = ["AWS_PROFILE", "AWS_DEFAULT_PROFILE"]
+        .iter()
+        .find_map(|v| env::var(v).ok().filter(|p| !p.is_empty()));
+    let env_keys = env::var_os("AWS_ACCESS_KEY_ID").is_some_and(|v| !v.is_empty());
+    if let Some(s) = shim_session(args, env_profile, env_keys, &config)
+        && expiry_for(&cache_dir(), &s.start_url) - now() <= 30
+        && super::enabled()
+    {
+        ensure(&s, &real);
+    }
+    let mut cmd = Command::new(&real);
+    cmd.args(args);
+    if let Ok(seen) = env::join_paths(&chain) {
+        cmd.env("AWS_SHIM_SEEN", seen);
+    }
+    crate::launch::exec_failed("aws", std::os::unix::process::CommandExt::exec(&mut cmd))
+}
+
+/// The session this aws call will read a token for, if any.
+fn shim_session(
+    args: &[OsString],
+    env_profile: Option<String>,
+    env_keys: bool,
+    config: &str,
+) -> Option<Session> {
+    let argv: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    // Logins (the guard's own calls land here), setup and help need no token.
+    let skip = ["sso", "sso-oidc", "configure", "help", "--version"];
+    if argv.iter().any(|a| skip.contains(&a.as_str())) {
+        return None;
+    }
+    let explicit = argv_profile(&argv).last().map(String::from);
+    // Env keys win over a profile from the environment, not over --profile.
+    if explicit.is_none() && env_keys {
+        return None;
+    }
+    let profile = explicit
+        .or(env_profile)
+        .unwrap_or_else(|| "default".to_string());
+    sessions(config)
+        .into_iter()
+        .find(|s| s.profiles.iter().any(|p| p.name == profile))
+}
+
+/// Make `s` usable now: refresh its token silently, else one click-free
+/// browser login. Serialised per session with the timer, so parallel callers
+/// (k9s fires get-token in bursts) share one login instead of a tab each.
+fn ensure(s: &Session, aws: &Path) -> bool {
+    let name = s.name.as_str();
+    let cache = cache_dir();
+    let fresh = || expiry_for(&cache, &s.start_url) - now() > 60;
+    // Blocking: a login in flight ends by itself (the CLI times out ~10 min).
+    let Some(lock) = lock_file(&Aws, name) else {
+        return false;
+    };
+    if lock.lock().is_err() {
+        return false;
+    }
+    if fresh() || (refresh(&cache, &s.start_url) && fresh()) {
+        return true; // another caller just logged in, or the session lives
+    }
+    if !graphical() {
+        eprintln!(
+            "sso-guard: {name} needs interactive login (no display): aws sso login --sso-session {name}"
+        );
+        return false;
+    }
+    eprintln!("sso-guard: {name} session over, logging in (browser)");
+    // stderr only: kubectl parses get-token's stdout as JSON.
+    let ok = Command::new(aws)
+        .args(["sso", "login", "--sso-session", name])
+        .stdout(Stdio::from(std::io::stderr()))
+        .status()
+        .is_ok_and(|st| st.success());
+    if ok {
+        clear_needs_you(&Aws, name);
+    }
+    ok
+}
+
+fn graphical() -> bool {
+    ["WAYLAND_DISPLAY", "DISPLAY"]
+        .iter()
+        .any(|v| env::var_os(v).is_some_and(|x| !x.is_empty()))
 }
 
 /// One botocore SSO cache file. The fields ccflip reads are typed; every
@@ -529,6 +649,43 @@ sso_session = elsewhere
         assert!(found("bash -c echo--profile p3").is_empty());
         assert!(found("aws --profiles p4").is_empty());
         assert!(found("aws --profile").is_empty()); // dangling flag
+    }
+
+    #[test]
+    fn shim_finds_the_session_this_call_reads_a_token_for() {
+        let config = "\
+[sso-session strat]
+sso_start_url = https://strat.example/start
+
+[profile staging]
+sso_session = strat
+
+[profile plain]
+region = eu-west-1
+";
+        let pick = |args: &str, env: Option<&str>, keys: bool| {
+            let args: Vec<OsString> = args.split_whitespace().map(OsString::from).collect();
+            shim_session(&args, env.map(String::from), keys, config).map(|s| s.name)
+        };
+        let strat = Some("strat".to_string());
+        assert_eq!(
+            pick("--profile staging sts get-caller-identity", None, false),
+            strat
+        );
+        assert_eq!(pick("s3 ls --profile=staging", None, false), strat);
+        // kubectl's exec plugin: the profile comes from the environment.
+        assert_eq!(
+            pick("--region eu-west-1 eks get-token", Some("staging"), false),
+            strat
+        );
+        // --profile beats env keys; env keys beat AWS_PROFILE.
+        assert_eq!(pick("--profile staging s3 ls", None, true), strat);
+        assert_eq!(pick("s3 ls", Some("staging"), true), None);
+        // Logins and setup are never intercepted; non-SSO profiles neither.
+        assert_eq!(pick("sso login --profile staging", None, false), None);
+        assert_eq!(pick("configure list --profile staging", None, false), None);
+        assert_eq!(pick("--profile plain s3 ls", None, false), None);
+        assert_eq!(pick("s3 ls", None, false), None); // no [default]
     }
 
     #[test]

@@ -104,7 +104,12 @@ fn main() {
     // caller already chose when CCFLIP_ROUTED (our own descendants),
     // CLAUDE_CONFIG_DIR (an explicit `cswap run` session) or
     // CLAUDE_CODE_USE_BEDROCK (forced Bedrock) is set.
-    if invoked_as_claude() {
+    // Invoked as `aws`: log in on demand when the call's SSO session has
+    // expired, then hand over to the real aws.
+    if invoked_as("aws") {
+        guard::aws::shim(&args)
+    }
+    if invoked_as("claude") {
         let chose_already = [
             "CCFLIP_ROUTED",
             "CLAUDE_CONFIG_DIR",
@@ -144,16 +149,16 @@ fn main() {
 }
 
 /// argv[0] shim check: a `claude` symlink pointing at this binary makes every
-/// plain `claude` launch route, no wrapper script needed. `claude_program()`
-/// already skips PATH entries that resolve back to us, so the real binary is
-/// still reachable.
-fn invoked_as_claude() -> bool {
+/// plain `claude` launch route, an `aws` one logs in on demand, no wrapper
+/// script needed. `launch::real_program()` skips PATH entries that resolve
+/// back to us, so the real binary is still reachable.
+fn invoked_as(name: &str) -> bool {
     env::args_os()
         .next()
         .map(PathBuf::from)
         .as_deref()
         .and_then(Path::file_name)
-        .is_some_and(|n| n == "claude")
+        .is_some_and(|n| n == name)
 }
 
 /// cswap and claude live in ~/.local/bin, which GUI spawns (t3code) and the

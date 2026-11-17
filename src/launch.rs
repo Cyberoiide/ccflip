@@ -30,34 +30,43 @@ fn dry_run(decision: &str) {
     }
 }
 
-fn exec_failed(program: &str, err: io::Error) -> ! {
+pub fn exec_failed(program: &str, err: io::Error) -> ! {
     eprintln!("ccflip: exec {program} failed: {err}");
     std::process::exit(127);
 }
 
-/// Resolve `claude` on PATH, never ourselves: a `claude` symlink pointing at
-/// ccflip (the shim setup) must not self-exec forever.
-fn claude_program() -> PathBuf {
+/// Resolve `program` on PATH, never ourselves: a `claude` or `aws` symlink
+/// pointing at ccflip (the shim setup) must not self-exec forever.
+pub fn real_program(program: &str) -> PathBuf {
+    real_program_skipping(program, &[])
+}
+
+/// [`real_program`], also skipping every binary in `skip` (canonical paths).
+pub fn real_program_skipping(program: &str, skip: &[PathBuf]) -> PathBuf {
     let me = env::current_exe()
         .ok()
         .and_then(|p| fs::canonicalize(p).ok());
     let mut saw_self = false;
     for dir in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
-        let candidate = dir.join("claude");
+        let candidate = dir.join(program);
         let Ok(real) = fs::canonicalize(&candidate) else {
             continue;
         };
-        if me.as_ref() == Some(&real) {
+        if me.as_ref() == Some(&real) || skip.contains(&real) {
             saw_self = true;
             continue;
         }
         return candidate;
     }
     if saw_self {
-        eprintln!("ccflip: every `claude` on PATH is ccflip itself — refusing to exec-loop");
+        eprintln!("ccflip: every `{program}` on PATH is ccflip itself — refusing to exec-loop");
         std::process::exit(127);
     }
-    PathBuf::from("claude") // let exec produce its own not-found error
+    PathBuf::from(program) // let exec produce its own not-found error
+}
+
+fn claude_program() -> PathBuf {
+    real_program("claude")
 }
 
 pub fn exec_claude(args: &[OsString]) -> ! {

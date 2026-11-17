@@ -39,6 +39,11 @@ case by case against the bash versions (see Testing).
 - `ccflip ui` (ratatui): live terminal dashboard of the credentials and the
   Claude accounts, works over SSH; `l` logs in to the selected account.
 - `ccflip login <provider>.<account>`: the same login from a script.
+- On-demand AWS login: symlinked as `aws` (ahead of the real CLI on PATH),
+  ccflip refreshes, or logs in click-free, an expired sso-session right
+  before the call that needs it, then runs the real `aws`. One lock per
+  session is shared with the timer, so bursts (k9s) open one tab. Ends the
+  manual `aws sso login` after every break under a 1h Identity Center cap.
 
 ### CLI
 

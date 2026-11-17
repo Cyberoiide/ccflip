@@ -271,6 +271,24 @@ and re-logged only while something uses them: a process with
 accounts in the last 65 min. Unused, they lapse quietly — log in on demand.
 It never changes Identity Center settings: session length is the org's policy.
 
+**On-demand login.** With a 1h Identity Center cap, "unused" means the
+session dies during every break. Symlink the binary as `aws` ahead of the
+real CLI:
+
+```bash
+ln -sf "$(command -v ccflip)" ~/.local/bin/aws
+```
+
+When a call's profile (`--profile`, `AWS_PROFILE`) belongs to an
+sso-session whose token has expired, ccflip first refreshes it silently, or
+runs the click-free browser login, behind a per-session lock shared with the
+timer. Then it runs the real `aws`. kubectl's `aws eks get-token`, ssm
+tunnels and scripts stop failing with "Token has expired" after a break.
+Login output goes to stderr, because kubectl parses stdout. Logins,
+`configure`, env-key calls and non-SSO profiles pass straight through. Tools
+that read the SSO cache without spawning `aws` (Terraform, boto3) aren't
+covered.
+
 ### gcloud
 
 Every `gcloud auth list` account, plus application-default credentials when

@@ -12,7 +12,7 @@
 //! `sso-guard.timer` is the reboot-safe backstop (and the poll for
 //! providers whose expiry cannot be known in advance).
 
-mod aws;
+pub mod aws;
 mod gcloud;
 
 use std::env;
@@ -121,7 +121,7 @@ pub fn run() -> i32 {
     }
     // sso-off disables the backstop timer; a run already in flight (or a
     // stale sso-guard-next) must then do nothing and not re-arm itself.
-    if !systemctl_quiet(&["is-enabled", "sso-guard.timer"]) {
+    if !enabled() {
         println!("sso-guard: disabled (sso-off), skipping");
         return 0;
     }
@@ -285,6 +285,18 @@ fn dismissed(key: &str) -> PathBuf {
 pub fn clear_needs_you(p: &dyn Provider, account: &str) {
     let _ = fs::remove_file(needs_you(p, account));
     let _ = fs::remove_file(dismissed(&key(p, account)));
+}
+
+/// Off (sso-off disabled the timer) = no keep-alive and no on-demand login.
+pub fn enabled() -> bool {
+    systemctl_quiet(&["is-enabled", "sso-guard.timer"])
+}
+
+/// Per-account login lock, shared by the timer and on-demand callers so
+/// they open at most one browser tab. Locked by the caller.
+pub fn lock_file(p: &dyn Provider, account: &str) -> Option<fs::File> {
+    let _ = fs::create_dir_all(state_dir());
+    fs::File::create(state_dir().join(format!("{}.lock", key(p, account)))).ok()
 }
 
 fn systemctl_quiet(args: &[&str]) -> bool {
