@@ -81,7 +81,7 @@ struct TranscriptLine {
     #[serde(default)]
     is_api_error_message: bool,
     #[serde(default)]
-    api_error_status: Option<serde_json::Value>,
+    api_error_status: Option<serde::de::IgnoredAny>,
     message: Option<TranscriptMessage>,
 }
 

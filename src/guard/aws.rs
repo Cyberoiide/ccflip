@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 
 use super::{Account, Provider, Run, ask_login, clear_needs_you, needs_you};
 use crate::{clock, cswap, epoch, now, stamp};
@@ -231,23 +232,72 @@ fn check(aws: &Aws, run: &mut Run) {
     }
 }
 
-fn cache_entries(cache: &Path) -> Vec<(PathBuf, Value)> {
+/// One botocore SSO cache file. The fields ccflip reads are typed; every
+/// other field rides in `rest` so a refresh writes the file back intact.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedToken {
+    // Required: client-registration files in the same directory lack it, so they fail to parse and are skipped.
+    start_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    region: Option<String>,
+    #[serde(flatten)]
+    rest: Map<String, Value>,
+}
+
+/// OIDC `CreateToken` response.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NewToken {
+    access_token: String,
+    expires_in: i64,
+    refresh_token: Option<String>,
+}
+
+/// AWS CLI role-credential cache file (`~/.aws/cli/cache/*.json`).
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RoleCreds {
+    credentials: RoleCredsInner,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RoleCredsInner {
+    account_id: String,
+}
+
+/// Cache files for `start_url`. A file that is not a valid cache entry is
+/// skipped, never rewritten.
+fn cache_entries(cache: &Path, start_url: &str) -> Vec<(PathBuf, CachedToken)> {
     let Ok(dir) = fs::read_dir(cache) else {
         return Vec::new();
     };
     dir.flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .filter_map(|p| Some((p.clone(), serde_json::from_slice(&fs::read(&p).ok()?).ok()?)))
+        .filter_map(|p| {
+            let t: CachedToken = serde_json::from_slice(&fs::read(&p).ok()?).ok()?;
+            (t.start_url == start_url).then_some((p, t))
+        })
         .collect()
 }
 
 /// Newest access-token expiry for `start_url`, as an epoch second (0 = none).
 fn expiry_for(cache: &Path, start_url: &str) -> i64 {
-    cache_entries(cache)
+    cache_entries(cache, start_url)
         .iter()
-        .filter(|(_, v)| v["startUrl"] == start_url)
-        .filter_map(|(_, v)| epoch(v["expiresAt"].as_str()?))
+        .filter_map(|(_, t)| epoch(t.expires_at.as_deref()?))
         .max()
         .unwrap_or(0)
 }
@@ -258,37 +308,35 @@ fn expiry_for(cache: &Path, start_url: &str) -> i64 {
 /// the SSO token. Posting ourselves also keeps the refresh token and client
 /// secret out of argv, where any local user could read them.
 fn refresh(cache: &Path, start_url: &str) -> bool {
-    cache_entries(cache)
+    cache_entries(cache, start_url)
         .into_iter()
-        .filter(|(_, v)| v["startUrl"] == start_url)
-        .any(|(path, mut v)| {
-            let Some(r) = create_token(&v) else {
+        .any(|(path, mut t)| {
+            let Some(r) = create_token(&t) else {
                 return false;
             };
-            let Some(expires_in) = r["expiresIn"].as_i64() else {
+            let Some(expires_at) = stamp(now() + r.expires_in) else {
                 return false;
             };
-            let Some(expires_at) = stamp(now() + expires_in) else {
-                return false;
-            };
-            v["accessToken"] = r["accessToken"].clone();
-            if r["refreshToken"].is_string() {
-                v["refreshToken"] = r["refreshToken"].clone();
+            t.access_token = Some(r.access_token);
+            if r.refresh_token.is_some() {
+                t.refresh_token = r.refresh_token;
             }
-            v["expiresAt"] = expires_at.into();
-            write_private(&path, v.to_string().as_bytes()).is_ok()
+            t.expires_at = Some(expires_at);
+            serde_json::to_vec(&t).is_ok_and(|data| write_private(&path, &data).is_ok())
         })
 }
 
-fn create_token(cached: &Value) -> Option<Value> {
-    let field = |k: &str| cached[k].as_str().filter(|s| !s.is_empty());
+fn create_token(cached: &CachedToken) -> Option<NewToken> {
+    fn field(f: &Option<String>) -> Option<&str> {
+        f.as_deref().filter(|s| !s.is_empty())
+    }
     let (id, secret, refresh) = (
-        field("clientId")?,
-        field("clientSecret")?,
-        field("refreshToken")?,
+        field(&cached.client_id)?,
+        field(&cached.client_secret)?,
+        field(&cached.refresh_token)?,
     );
     // The region becomes part of the host the secrets are posted to.
-    let region = field("region").filter(|r| {
+    let region = field(&cached.region).filter(|r| {
         r.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     })?;
@@ -313,8 +361,7 @@ fn create_token(cached: &Value) -> Option<Value> {
         .header("Content-Type", "application/json")
         .send(body.to_string())
         .ok()?;
-    let r: Value = serde_json::from_str(&resp.body_mut().read_to_string().ok()?).ok()?;
-    r["accessToken"].is_string().then_some(r)
+    serde_json::from_str(&resp.body_mut().read_to_string().ok()?).ok()
 }
 
 /// The secrets go over TLS, or in clear only to this machine (tests, local
@@ -416,8 +463,8 @@ fn used_recently(s: &Session) -> Option<String> {
         if path.extension()? != "json" || minted.elapsed().ok()? >= Duration::from_secs(65 * 60) {
             return None;
         }
-        let v: Value = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
-        let account = v["Credentials"]["AccountId"].as_str()?;
+        let creds: RoleCreds = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+        let account = creds.credentials.account_id.as_str();
         let minted = jiff::Timestamp::try_from(minted).ok()?;
         accounts
             .contains(account)
@@ -504,5 +551,32 @@ sso_session = elsewhere
         assert_eq!(fs::read_to_string(&f).unwrap(), "new");
         assert_eq!(fs::metadata(&f).unwrap().mode() & 0o777, 0o600);
         assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cache_entries_round_trip_and_skip_what_they_cannot_type() {
+        let t = tempfile::tempdir().unwrap();
+        // Unknown fields survive; fields botocore did not write never appear
+        // as null.
+        let raw = r#"{"startUrl":"u","expiresAt":"2026-11-11T10:00:00Z","scopes":["a"],"extra":{"keep":1}}"#;
+        fs::write(t.path().join("a.json"), raw).unwrap();
+        // A wrongly typed field or another session: not ours to touch.
+        fs::write(t.path().join("b.json"), r#"{"startUrl":"u","expiresAt":7}"#).unwrap();
+        fs::write(t.path().join("c.json"), r#"{"startUrl":"v"}"#).unwrap();
+        fs::write(
+            t.path().join("botocore-client-id-x.json"),
+            r#"{"clientId":"x"}"#,
+        )
+        .unwrap();
+        let entries = cache_entries(t.path(), "u");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&entries[0].1).unwrap(),
+            serde_json::from_str::<Value>(raw).unwrap()
+        );
+        assert_eq!(
+            expiry_for(t.path(), "u"),
+            epoch("2026-11-11T10:00:00Z").unwrap()
+        );
     }
 }

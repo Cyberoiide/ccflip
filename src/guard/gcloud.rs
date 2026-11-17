@@ -27,7 +27,17 @@ const ADC: &str = "application-default";
 struct Listed {
     account: String,
     #[serde(default)]
-    status: String,
+    status: AuthStatus,
+}
+
+#[derive(Deserialize, Default, PartialEq)]
+enum AuthStatus {
+    #[serde(rename = "ACTIVE")]
+    Active,
+    /// gcloud prints "" for the other logged-in accounts.
+    #[default]
+    #[serde(other)]
+    Inactive,
 }
 
 /// (account, worth asking a human about): the active account and ADC are
@@ -45,7 +55,7 @@ fn accounts() -> Vec<(String, bool)> {
         .unwrap_or_default();
     let mut out: Vec<(String, bool)> = listed
         .into_iter()
-        .map(|l| (l.account, l.status == "ACTIVE"))
+        .map(|l| (l.account, l.status == AuthStatus::Active))
         .collect();
     let config = env::var_os("CLOUDSDK_CONFIG")
         .filter(|v| !v.is_empty())
@@ -152,13 +162,30 @@ impl Provider for Gcloud {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reads_gcloud_auth_list() {
+        // `gcloud auth list --format=json` shape; "ACTIVE" seen on real gcloud 593.
+        let listed: Vec<Listed> = serde_json::from_str(
+            r#"[{"account":"me@x.com","status":"ACTIVE"},{"account":"ci@x.iam","status":""},{"account":"old@x.com"}]"#,
+        )
+        .unwrap();
+        let active: Vec<bool> = listed
+            .iter()
+            .map(|l| l.status == AuthStatus::Active)
+            .collect();
+        assert_eq!(active, [true, false, false]);
+    }
+
     /// Verbatim gcloud 593 stderr.
     #[test]
     fn classifies_real_gcloud_errors() {
+        // Workspace session control, captured on a real account.
+        let reauth = "ERROR: (gcloud.auth.print-access-token) There was a problem refreshing your current auth tokens: Reauthentication failed. cannot prompt during non-interactive execution.\nPlease run:\n\n  $ gcloud auth login\n\nto obtain new credentials.";
         let dead = "ERROR: (gcloud.auth.print-access-token) There was a problem refreshing your current auth tokens: ('invalid_grant: Bad Request', {'error': 'invalid_grant', 'error_description': 'Bad Request'})\nPlease run:\n\n  $ gcloud auth login\n\nto obtain new credentials.";
         let none = "ERROR: (gcloud.auth.print-access-token) Your current active account [ghost@example.com] does not have any valid credentials\nPlease run:\n\n  $ gcloud auth login\n";
         let adc = "ERROR: (gcloud.auth.application-default.print-access-token) There was a problem refreshing your current auth tokens: ('invalid_grant: Bad Request', ...)\nPlease run:\n\n  $ gcloud auth application-default login\n";
         let offline = "ERROR: (gcloud.auth.print-access-token) HTTPSConnectionPool(host='oauth2.googleapis.com', port=443): Max retries exceeded with url: /token";
+        assert_eq!(dead_credentials(reauth), State::Expired);
         assert_eq!(dead_credentials(dead), State::Expired);
         assert_eq!(dead_credentials(none), State::Expired);
         assert_eq!(dead_credentials(adc), State::Expired);
