@@ -146,6 +146,17 @@ left, and opens the one-click browser login only when the Identity Center
 session itself has died. Not needed on instance-role hosts. Claude Code's
 own `awsAuthRefresh` setting stays as the in-session belt.
 
+**On-demand login (`bin/aws` shim).** Sessions outside `SSO_GUARD_BROWSER`
+lapse while unused. With a 1h Identity Center cap, that means after every
+break. Link `bin/aws` as `~/.local/bin/aws`, ahead of the real `aws` on PATH.
+When a command's profile belongs to an sso-session whose token has expired,
+the shim runs `sso-guard ensure <session>` first. That refreshes the token
+silently, or runs the click-free browser login, behind one lock so parallel
+callers like k9s open a single tab. Then the real `aws` runs. kubectl's
+`aws eks get-token`, ssm tunnels and plain `aws` calls stop failing with
+"Token has expired" after a break. Tools that read the SSO cache without
+spawning `aws` (Terraform, boto3 scripts) don't get this.
+
 ## Gotchas
 
 - Never run `cswap run` from a shell still carrying `CLAUDE_CODE_USE_BEDROCK=1`:
