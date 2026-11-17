@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# aws shim — log in on demand. An org that caps IAM Identity Center sessions
+# at 1h kills the session during every break; sso-guard deliberately lets an
+# unused one lapse rather than open a browser tab per hour. So the first call
+# after a break finds it dead: here, when the profile this call uses is bound
+# to an sso-session whose cached token has expired, `sso-guard ensure` first
+# refreshes it or runs the click-free browser login. Then the real aws runs.
+# Covers everything that spawns `aws` from a shell PATH: you, kubectl's
+# `aws eks get-token`, bastion/ssm tunnels.
+self=$(readlink -f "$0")
+# Every shim already on this call's chain is skipped, not just this one: two
+# shims in different PATH dirs (bash + ccflip mid-migration) would otherwise
+# exec each other forever.
+seen=":${AWS_SHIM_SEEN:-}:$self:"
+real=""
+IFS=: read -ra dirs <<<"$PATH"
+for d in "${dirs[@]}"; do
+    r=$(readlink -f "$d/aws" 2>/dev/null) || continue
+    [[ -x "$d/aws" && "$seen" != *":$r:"* ]] && { real="$d/aws"; break; }
+done
+[[ -n "$real" ]] || { echo "aws shim: no real aws on PATH" >&2; exit 127; }
+export AWS_SHIM_SEEN="${AWS_SHIM_SEEN:+$AWS_SHIM_SEEN:}$self"
+
+profile=${AWS_PROFILE:-${AWS_DEFAULT_PROFILE:-default}} explicit=0 skip=0
+args=("$@")
+for (( i = 0; i < ${#args[@]}; i++ )); do
+    case ${args[i]} in
+        --profile) profile=${args[i+1]:-}; explicit=1 ;;
+        --profile=*) profile=${args[i]#--profile=}; explicit=1 ;;
+        # Logins (sso-guard's own calls land here), setup and help never need a token.
+        sso | sso-oidc | configure | help | --version) skip=1 ;;
+    esac
+done
+# Env keys win over a profile from the environment, not over --profile.
+[[ -n "${AWS_ACCESS_KEY_ID:-}" && $explicit == 0 ]] && skip=1
+
+if (( ! skip )) && [[ -n "$profile" ]]; then
+    session=$(awk -v p="$profile" '
+        /^\[/ { inp = ($0 == "[profile " p "]" || (p == "default" && $0 == "[default]")); next }
+        inp && $1 == "sso_session" { print $3; exit }' "${AWS_CONFIG_FILE:-$HOME/.aws/config}" 2>/dev/null)
+    if [[ -n "$session" ]]; then
+        # botocore names the token file after the sha1 of the session name.
+        f="$HOME/.aws/sso/cache/$(printf %s "$session" | sha1sum | cut -c1-40).json"
+        exp=$(jq -r '.expiresAt // empty' "$f" 2>/dev/null)
+        e=$(date -d "${exp:-@0}" +%s 2>/dev/null || echo 0)
+        if (( e - $(date +%s) <= 30 )); then
+            # stderr only: kubectl parses this command's stdout as JSON.
+            "$(dirname "$self")/sso-guard" ensure "$session" >&2 || true
+        fi
+    fi
+fi
+exec "$real" "$@"

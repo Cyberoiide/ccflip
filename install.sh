@@ -8,6 +8,8 @@ command -v cswap >/dev/null 2>&1 || uv tool install claude-swap
 mkdir -p "$HOME/.local/bin" "$HOME/.config/systemd/user"
 ln -sf "$PWD/bin/ccflip" "$HOME/.local/bin/ccflip"
 ln -sf "$PWD/bin/ccflip-watch" "$HOME/.local/bin/ccflip-watch"
+# On-demand SSO login; inert for profiles without an sso_session.
+command -v aws >/dev/null 2>&1 && ln -sf "$PWD/bin/aws" "$HOME/.local/bin/aws"
 ln -sf "$PWD/statusline.sh" "$HOME/.local/bin/ccflip-statusline"
 chmod +x bin/ccflip bin/ccflip-watch statusline.sh
 

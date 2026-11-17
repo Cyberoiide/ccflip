@@ -10,6 +10,9 @@
 # dead does it open the browser login (one click against a live IdP session),
 # and only on a graphical session.
 #
+# `sso-guard ensure <session>` does the same for one session on demand; the
+# `aws` shim (bin/aws) calls it when a command's session has expired.
+#
 # Scheduling is adaptive: each run arms a transient timer to wake ~1 min
 # before the earliest token crosses the threshold. The static hourly timer
 # is only the reboot-safe backstop.
@@ -155,6 +158,30 @@ expiry_for() { # $1 = start_url -> newest expiresAt epoch (0 if none)
     echo "$best"
 }
 
+# On-demand mode, called by the `aws` shim right before a command whose
+# session token has expired: refresh it, or run the click-free browser login,
+# so nothing ever needs a manual `aws sso login` after a break. The lock is
+# shared with the loop below so concurrent callers (k9s fires get-token in
+# parallel) and the timer open at most one browser tab.
+if [[ ${1:-} == ensure ]]; then
+    name=${2:?usage: sso-guard ensure <sso-session>}
+    url=$(sessions | awk -F'\t' -v n="$name" '$1 == n { print $2 }')
+    [[ -n "$url" ]] || exit 1
+    exec 9>"$STATE/$name.lock"
+    flock -w 660 9 || exit 1 # a login in flight times out after ~10 min
+    fresh() { (( $(expiry_for "$url") - $(date +%s) > 60 )); }
+    fresh && exit 0 # another caller just logged in
+    refresh_silently "$url" && fresh && exit 0
+    if [[ -z "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
+        echo "sso-guard: $name needs interactive login (no display): aws sso login --sso-session $name" >&2
+        exit 1
+    fi
+    echo "sso-guard: $name session over, logging in (browser)" >&2
+    aws sso login --sso-session "$name" >&2 || exit 1
+    rm -f "$STATE/$name.needs-you" "$STATE/$name.needs-you.dismissed"
+    exit 0
+fi
+
 rc=0
 now=$(date +%s)
 wake=0 # earliest epoch the next run should happen
@@ -214,7 +241,14 @@ while IFS=$'\t' read -r name url profile; do
         if [[ -e "$STATE/$name.needs-you" ]]; then
             ask_login "$name"; continue
         fi
-        if aws sso login --sso-session "$name"; then
+        exec 9>"$STATE/$name.lock"
+        if ! flock -n 9; then
+            echo "sso-guard: $name login already in progress (aws shim)"
+            exec 9>&-; want $(( now + 120 )); continue
+        fi
+        ok=0; aws sso login --sso-session "$name" && ok=1
+        exec 9>&-
+        if (( ok )); then
             track "$(expiry_for "$url")"
         else
             echo "sso-guard: $name browser login timed out, asking via notification instead of reopening the browser"
