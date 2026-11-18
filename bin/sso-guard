@@ -10,8 +10,10 @@
 # dead does it open the browser login (one click against a live IdP session),
 # and only on a graphical session.
 #
-# `sso-guard ensure <session>` does the same for one session on demand; the
-# `aws` shim (bin/aws) calls it when a command's session has expired.
+# Sessions are checked in parallel: a browser login can block ~10 min and
+# must never delay the others. `sso-guard ensure <session>` does the same for
+# one session on demand (the `aws` shim calls it when a command's session has
+# expired); `sso-guard login [session...]` for every listed session at once.
 #
 # Scheduling is adaptive: each run arms a transient timer to wake ~1 min
 # before the earliest token crosses the threshold. The static hourly timer
@@ -19,19 +21,34 @@
 set -euo pipefail
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 
+# SSO_GUARD_* knobs from policy.env, the environment still winning (as in
+# ccflip): one place the timer, the aws shim and your shell all read. Parsed,
+# not sourced.
+POLICY="${CCFLIP_POLICY:-$HOME/.config/ccflip/policy.env}"
+if [[ -r "$POLICY" ]]; then
+    while IFS='=' read -r k v; do
+        k=${k#export }
+        [[ $k =~ ^SSO_GUARD_[A-Z_]+$ && -z "${!k:-}" ]] || continue
+        v=${v%\"}; v=${v#\"}; v=${v%\'}; v=${v#\'}
+        export "$k=$v"
+    done <"$POLICY"
+fi
+
 # sso-off disables the backstop timer; a run already in flight (or a stale
-# sso-guard-next) must then do nothing and not re-arm itself.
-if ! systemctl --user is-enabled --quiet sso-guard.timer 2>/dev/null; then
+# sso-guard-next) must then do nothing and not re-arm itself. An explicit
+# `sso-guard login` still works.
+if [[ ${1:-} != login ]] && ! systemctl --user is-enabled --quiet sso-guard.timer 2>/dev/null; then
     echo "sso-guard: disabled (sso-off), skipping"
     exit 0
 fi
 
 MIN_SECONDS=$(( ${SSO_GUARD_MIN_MINUTES:-15} * 60 ))
-# Sessions allowed to open a browser login when their IdC session ends
-# (space-separated; "*" = all). Others are only kept alive silently: an
-# org that caps sessions at 1h would otherwise mean a consent click per hour
-# for a session nothing autonomous needs. Log in to those on demand.
-BROWSER_SESSIONS="${SSO_GUARD_BROWSER:-*}"
+# Sessions kept alive for good, browser login included, and the ones
+# `sso-guard login` logs in to (space-separated; "*" = all). Others are kept
+# alive only while in use: an org that caps sessions at 1h would otherwise
+# mean a browser tab per hour for a session nothing needs — the aws shim logs
+# those in on demand. SSO_GUARD_BROWSER is the old name.
+BROWSER_SESSIONS="${SSO_GUARD_SESSIONS:-${SSO_GUARD_BROWSER:-*}}"
 CONFIG="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
 
 # Emit one "session<TAB>start_url<TAB>first_profile" line per sso-session.
@@ -163,23 +180,60 @@ expiry_for() { # $1 = start_url -> newest expiresAt epoch (0 if none)
 # so nothing ever needs a manual `aws sso login` after a break. The lock is
 # shared with the loop below so concurrent callers (k9s fires get-token in
 # parallel) and the timer open at most one browser tab.
-if [[ ${1:-} == ensure ]]; then
-    name=${2:?usage: sso-guard ensure <sso-session>}
+ensure_session() { # $1 = session name -> 0 once it has a usable token
+    local name=$1 url
     url=$(sessions | awk -F'\t' -v n="$name" '$1 == n { print $2 }')
-    [[ -n "$url" ]] || exit 1
+    [[ -n "$url" ]] || { echo "sso-guard: no sso-session '$name' in $CONFIG" >&2; return 1; }
     exec 9>"$STATE/$name.lock"
-    flock -w 660 9 || exit 1 # a login in flight times out after ~10 min
+    flock -w 660 9 || return 1 # a login in flight times out after ~10 min
     fresh() { (( $(expiry_for "$url") - $(date +%s) > 60 )); }
-    fresh && exit 0 # another caller just logged in
-    refresh_silently "$url" && fresh && exit 0
+    fresh && return 0 # another caller just logged in
+    refresh_silently "$url" && fresh && return 0
     if [[ -z "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
         echo "sso-guard: $name needs interactive login (no display): aws sso login --sso-session $name" >&2
-        exit 1
+        return 1
     fi
     echo "sso-guard: $name session over, logging in (browser)" >&2
-    aws sso login --sso-session "$name" >&2 || exit 1
+    # The browser aws spawns inherits its fds and can linger for minutes:
+    # through a file, streamed live, so a caller reading our stderr through a
+    # pipe (a script, an agent's shell) is not held open by the browser.
+    local log pid rc=0
+    log=$(mktemp)
+    aws sso login --sso-session "$name" >"$log" 2>&1 &
+    pid=$!
+    tail -n +1 -s 0.2 -f --pid="$pid" "$log" >&2
+    wait "$pid" || rc=$?
+    rm -f "$log"
+    (( rc == 0 )) || return 1
     rm -f "$STATE/$name.needs-you" "$STATE/$name.needs-you.dismissed"
-    exit 0
+}
+
+if [[ ${1:-} == ensure ]]; then
+    ensure_session "${2:?usage: sso-guard ensure <sso-session>}"
+    exit
+fi
+
+# Every listed session (default: SSO_GUARD_SESSIONS, "*" = all) made usable
+# now, all at once instead of one login after the other.
+if [[ ${1:-} == login ]]; then
+    shift
+    names=("$@")
+    if (( ${#names[@]} == 0 )); then
+        if [[ "$BROWSER_SESSIONS" == "*" ]]; then
+            mapfile -t names < <(sessions | awk -F'\t' '$3 != "" { print $1 }')
+        else
+            read -ra names <<<"$BROWSER_SESSIONS"
+        fi
+    fi
+    declare -A job=()
+    for n in "${names[@]}"; do ensure_session "$n" </dev/null & job[$n]=$!; done
+    rc=0
+    for n in "${names[@]}"; do
+        if wait "${job[$n]}"; then echo "sso-guard: $n ok"; else echo "sso-guard: $n FAILED" >&2; rc=1; fi
+    done
+    # Re-arm the timer from the new tokens.
+    systemctl --user start --no-block sso-guard.service >/dev/null 2>&1 || true
+    exit "$rc"
 fi
 
 rc=0
@@ -189,14 +243,16 @@ want() { if (( $1 > 0 )) && (( wake == 0 || $1 < wake )); then wake=$1; fi; }
 # Healthy token: wake 1 min before it dips under the threshold.
 track() { want $(( $1 - MIN_SECONDS - 60 )); }
 
-while IFS=$'\t' read -r name url profile; do
-    [[ -n "$profile" ]] || continue # nothing consumes this session
+# One session's keep-alive pass, in its own background job; want/track/rc
+# act on that job's copies, reported back through $results.
+check_session() { # $1 = name, $2 = start url
+    local name=$1 url=$2 e gated why ok
     e=$(expiry_for "$url")
     # +90s slack: the re-arm wakes 60s before the threshold, so act now
     # instead of sleeping 1 more minute and waking again.
     if (( e - now > MIN_SECONDS + 90 )); then
         rm -f "$STATE/$name.needs-you" "$STATE/$name.needs-you.dismissed"
-        track "$e"; continue
+        track "$e"; return 0
     fi
 
     # Sessions outside the allowlist are only worth keeping while something
@@ -207,7 +263,7 @@ while IFS=$'\t' read -r name url profile; do
         why=$(in_use "$name") || why=$(used_recently "$name") || why=""
         if [[ -z "$why" ]] && (( e <= now )); then
             echo "sso-guard: $name expired, unused, letting it lapse (aws sso login --sso-session $name)"
-            continue
+            return 0
         fi
     fi
 
@@ -220,16 +276,16 @@ while IFS=$'\t' read -r name url profile; do
         # that same session and buy nothing, so sleep until it ends.
         if (( e - now > 3000 )); then
             echo "sso-guard: $name access token refreshed silently"
-            track "$e"; continue
+            track "$e"; return 0
         fi
         echo "sso-guard: $name session ends $(date -d "@$e" +%H:%M), login then"
-        want $(( e + 30 )); continue
+        want $(( e + 30 )); return 0
     fi
 
     if (( gated )); then
         if [[ -z "$why" ]]; then
             echo "sso-guard: $name session over, unused, letting it lapse (aws sso login --sso-session $name)"
-            continue
+            return 0
         fi
         echo "sso-guard: $name in use ($why), re-login"
     fi
@@ -239,12 +295,12 @@ while IFS=$'\t' read -r name url profile; do
         # session is gone too and a human is needed: ask once via a
         # notification instead of opening a new tab on every run.
         if [[ -e "$STATE/$name.needs-you" ]]; then
-            ask_login "$name"; continue
+            ask_login "$name"; return 0
         fi
         exec 9>"$STATE/$name.lock"
         if ! flock -n 9; then
             echo "sso-guard: $name login already in progress (aws shim)"
-            exec 9>&-; want $(( now + 120 )); continue
+            exec 9>&-; want $(( now + 120 )); return 0
         fi
         ok=0; aws sso login --sso-session "$name" && ok=1
         exec 9>&-
@@ -259,7 +315,19 @@ while IFS=$'\t' read -r name url profile; do
         echo "sso-guard: '$name' needs interactive login (no display): aws sso login --sso-session $name" >&2
         rc=1
     fi
+}
+
+results=$(mktemp -d); trap 'rm -rf "$results"' EXIT
+while IFS=$'\t' read -r name url profile; do
+    [[ -n "$profile" ]] || continue # nothing consumes this session
+    ( wake=0 rc=0; check_session "$name" "$url"; echo "$wake $rc" >"$results/$name" ) </dev/null &
 done < <(sessions)
+wait
+for f in "$results"/*; do
+    [[ -e "$f" ]] || continue
+    read -r w r <"$f"
+    want "$w"; (( r == 0 )) || rc=1
+done
 
 # Adaptive re-arm. Failure retries in 10 min; no data falls back to the
 # hourly backstop timer. Clamped to [1 min, 6 h].

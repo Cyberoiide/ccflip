@@ -146,7 +146,16 @@ left, and opens the one-click browser login only when the Identity Center
 session itself has died. Not needed on instance-role hosts. Claude Code's
 own `awsAuthRefresh` setting stays as the in-session belt.
 
-**On-demand login (`bin/aws` shim).** Sessions outside `SSO_GUARD_BROWSER`
+**Session list.** `SSO_GUARD_SESSIONS` (space-separated `[sso-session]`
+names, default `*` for all) lists the sessions kept alive for good, browser
+login included. Set it in `~/.config/ccflip/policy.env` so the timer, the
+shim and your shell all read the same value; the environment still wins.
+`SSO_GUARD_BROWSER` is the old name. Sessions are checked in parallel, so one
+login waiting ~10 min on the browser never delays the others.
+`sso-guard login [session...]` logs in to every listed session at once and
+reports `ok`/`FAILED` per session. It works even while `sso-off`.
+
+**On-demand login (`bin/aws` shim).** Sessions outside `SSO_GUARD_SESSIONS`
 lapse while unused. With a 1h Identity Center cap, that means after every
 break. Link `bin/aws` as `~/.local/bin/aws`, ahead of the real `aws` on PATH.
 When a command's profile belongs to an sso-session whose token has expired,
