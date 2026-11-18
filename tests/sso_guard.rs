@@ -964,3 +964,147 @@ fn shim_never_ping_pongs_with_another_shim_on_path() {
     assert_eq!(o.rc, 0, "{}", o.calls);
     assert!(o.calls.ends_with("aws --profile sg-shim-pingpong s3 ls\n"));
 }
+
+/// Two sessions, both expired with a dead refresh token; each fake browser
+/// login takes 2 s. Knobs come from policy.env, as on a real host.
+struct Two {
+    t: tempfile::TempDir,
+    _oidc: Arc<Mutex<Vec<String>>>,
+    endpoint: String,
+}
+
+fn two_sessions(policy: &str) -> Two {
+    let t = tempfile::tempdir().unwrap();
+    let p = t.path();
+    let bin = p.join("bin");
+    let cache = p.join(".aws/sso/cache");
+    for d in [&bin, &cache] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let mut config = String::new();
+    for n in ["p1", "p2"] {
+        config += &format!(
+            "[sso-session sg-{n}]\nsso_start_url = https://{n}.example/start\nsso_region = eu-west-1\n\n[profile {n}-prof]\nsso_session = sg-{n}\nsso_account_id = 22222222222{}\n\n",
+            &n[1..]
+        );
+        fs::write(
+            cache.join(format!("tok-{n}.json")),
+            format!(
+                r#"{{"startUrl":"https://{n}.example/start","region":"eu-west-1","accessToken":"old","expiresAt":"{}","clientId":"c","clientSecret":"s","refreshToken":"r"}}"#,
+                stamp(now() - 300)
+            ),
+        )
+        .unwrap();
+    }
+    fs::write(p.join(".aws/config"), config).unwrap();
+    fs::write(p.join("policy.env"), policy).unwrap();
+    write_exec(
+        &bin.join("systemctl"),
+        "#!/usr/bin/env bash\ncase \"$*\" in *is-enabled*) exit \"${TIMER_RC:-0}\" ;; esac\n",
+    );
+    write_exec(&bin.join("systemd-run"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("notify-send"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("gcloud"), "#!/bin/sh\necho []\n");
+    write_exec(
+        &bin.join("aws"),
+        r#"#!/usr/bin/env bash
+echo "aws $*" >> "$CALLS"
+[[ "$1 $2" == "sso login" ]] || exit 0
+s=${!#}; sleep 2
+# Like a browser: a child that inherits our fds and outlives the login.
+[[ -n "${LINGER:-}" ]] && { sleep 30 & }
+[[ " ${LOGIN_FAIL:-} " == *" $s "* ]] && exit 1
+f="$HOME/.aws/sso/cache/tok-${s#sg-}.json"
+jq --arg e "$(date -u -d +28800sec +%FT%TZ)" '.expiresAt = $e' "$f" > "$f.t" && mv "$f.t" "$f"
+"#,
+    );
+    let (endpoint, oidc) = serve(denied());
+    Two {
+        t,
+        _oidc: oidc,
+        endpoint,
+    }
+}
+
+/// (stdout, rc, seconds, logins per session).
+fn run_two(two: &Two, args: &[&str], env: &[(&str, &str)]) -> (String, i32, f64, Vec<usize>) {
+    let p = two.t.path();
+    let calls = p.join("calls");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ccflip"));
+    cmd.args(args)
+        .env_clear()
+        .env("HOME", p)
+        .env("PATH", format!("{}:/usr/bin:/bin", p.join("bin").display()))
+        .env("XDG_STATE_HOME", p.join("state"))
+        .env("CCFLIP_POLICY", p.join("policy.env"))
+        .env("CALLS", &calls)
+        .env("WAYLAND_DISPLAY", "wayland-1")
+        .env("AWS_ENDPOINT_URL_SSO_OIDC", &two.endpoint)
+        .envs(env.iter().copied());
+    let start = std::time::Instant::now();
+    let out = cmd.output().unwrap();
+    let secs = start.elapsed().as_secs_f64();
+    let calls = fs::read_to_string(&calls).unwrap_or_default();
+    let logins = ["sg-p1", "sg-p2"]
+        .iter()
+        .map(|s| {
+            calls
+                .matches(&format!("sso login --sso-session {s}\n"))
+                .count()
+        })
+        .collect();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code().unwrap_or(-1),
+        secs,
+        logins,
+    )
+}
+
+#[test]
+fn guard_checks_listed_sessions_in_parallel() {
+    let two = two_sessions("SSO_GUARD_SESSIONS=\"sg-p1 sg-p2\"\n");
+    let (_, rc, secs, logins) = run_two(&two, &["sso-guard"], &[]);
+    assert_eq!((rc, logins), (0, vec![1, 1]));
+    assert!(secs < 3.5, "sessions ran one after the other: {secs:.1}s");
+}
+
+#[test]
+fn environment_session_list_beats_policy_env() {
+    // sg-p1 (only in policy.env) is unused, so it lapses instead of a tab.
+    let two = two_sessions("SSO_GUARD_SESSIONS=sg-p1\n");
+    let (out, _, _, logins) = run_two(&two, &["sso-guard"], &[("SSO_GUARD_SESSIONS", "sg-p2")]);
+    assert_eq!(logins, [0, 1]);
+    assert!(
+        out.contains("sg-p1 expired, unused, letting it lapse"),
+        "{out}"
+    );
+}
+
+#[test]
+fn login_aws_logs_in_every_listed_session_at_once() {
+    let two = two_sessions("SSO_GUARD_SESSIONS=\"sg-p1 sg-p2\"\n");
+    let (out, rc, secs, logins) = run_two(
+        &two,
+        &["login", "aws"],
+        &[("LOGIN_FAIL", "sg-p2"), ("TIMER_RC", "1")], // works while sso-off
+    );
+    assert_eq!((rc, logins), (1, vec![1, 1]));
+    assert!(secs < 3.5, "logins ran one after the other: {secs:.1}s");
+    assert!(
+        out.contains("sg-p1 ok") && out.contains("sg-p2 FAILED"),
+        "{out}"
+    );
+    // Now fresh (sg-p1) is a no-op; the failed one is retried.
+    let (_, _, _, logins) = run_two(&two, &["login", "aws"], &[]);
+    assert_eq!(logins, [1, 2]);
+}
+
+#[test]
+fn login_never_waits_on_a_lingering_browser() {
+    // `output()` reads through pipes: a browser holding them would block it.
+    let two = two_sessions("SSO_GUARD_SESSIONS=sg-p1\n");
+    let (_, rc, secs, _) = run_two(&two, &["login", "aws"], &[("LINGER", "1")]);
+    assert_eq!(rc, 0);
+    assert!(secs < 6.0, "held open by the browser: {secs:.1}s");
+}

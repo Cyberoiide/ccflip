@@ -16,7 +16,7 @@ One static Rust binary, nine subcommands:
 | `ccflip watch` | rotation, mid-session tier switching, policy guard, alerts (systemd unit) |
 | `ccflip sso-guard` | keep AWS SSO / gcloud credentials fresh (systemd, adaptive) |
 | `ccflip status` | every guarded account (AWS SSO, gcloud) and its state, as JSON |
-| `ccflip login <provider>.<account>` | log in to one guarded account (`aws.heka`, `gcloud.me@x.com`) |
+| `ccflip login <provider>.<account>...` | log in to guarded accounts at once (`aws.heka`, `gcloud.me@x.com`); `ccflip login aws` = every listed SSO session |
 | `ccflip ui` | live terminal dashboard: credentials + Claude accounts (works over SSH) |
 | `ccflip statusline` | print the account chip for the statusline |
 | `ccflip install` | claude-swap + systemd units on this host |
@@ -264,9 +264,14 @@ Per `[sso-session]` in `~/.aws/config` that some profile uses:
    signed in. If that times out, one persistent notification ("click to log
    in") instead of a new tab every run; dismissed, it asks again after 2 h.
 
-`SSO_GUARD_BROWSER` (space-separated session names, default `*` = all) limits
-which sessions may log in on their own. The others are kept alive silently
-and re-logged only while something uses them: a process with
+`SSO_GUARD_SESSIONS` (space-separated session names, default `*` = all; the
+old name `SSO_GUARD_BROWSER` still works) lists the sessions kept alive for
+good, browser login included. Sessions are checked in parallel, so one login
+waiting ~10 min on the browser never delays the others. `ccflip login aws`
+makes every listed session usable at once (refresh, else one click-free
+login), prints `ok`/`FAILED` per session, and works while `sso-off`. The
+unlisted sessions are kept alive silently and re-logged only while something
+uses them: a process with
 `--profile P` / `AWS_PROFILE=P`, or role credentials minted for one of its
 accounts in the last 65 min. Unused, they lapse quietly — log in on demand.
 It never changes Identity Center settings: session length is the org's policy.
@@ -284,7 +289,9 @@ sso-session whose token has expired, ccflip first refreshes it silently, or
 runs the click-free browser login, behind a per-session lock shared with the
 timer. Then it runs the real `aws`. kubectl's `aws eks get-token`, ssm
 tunnels and scripts stop failing with "Token has expired" after a break.
-Login output goes to stderr, because kubectl parses stdout. Logins,
+Login output goes to stderr, because kubectl parses stdout, and through a file:
+the browser `aws` spawns can linger for minutes, and a caller reading stderr
+through a pipe must not wait on it. Logins,
 `configure`, env-key calls and non-SSO profiles pass straight through. Tools
 that read the SSO cache without spawning `aws` (Terraform, boto3) aren't
 covered.
@@ -306,7 +313,7 @@ Knobs live in `~/.config/ccflip/policy.env` (the environment still wins), so
 reinstalling the units never loses them:
 
 ```bash
-SSO_GUARD_BROWSER=heka
+SSO_GUARD_SESSIONS="heka stratumn"
 SSO_GUARD_MIN_MINUTES=15
 ```
 

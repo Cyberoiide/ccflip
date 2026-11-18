@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use crate::{cswap, launch};
 
+#[derive(Clone)]
 pub struct Policy {
     vars: Vec<(String, String)>,
 }

@@ -93,6 +93,23 @@ impl Run {
         }
     }
 
+    /// A copy for one concurrent check: same clock and knobs, its own
+    /// wake-up and failure, merged back with [`Run::join`].
+    pub fn fork(&self) -> Run {
+        Run {
+            now: self.now,
+            min_seconds: self.min_seconds,
+            policy: self.policy.clone(),
+            wake: 0,
+            failed: false,
+        }
+    }
+
+    pub fn join(&mut self, other: Run) {
+        self.want(other.wake);
+        self.failed |= other.failed;
+    }
+
     pub fn want(&mut self, at: i64) {
         if at > 0 && (self.wake == 0 || at < self.wake) {
             self.wake = at;
@@ -167,6 +184,29 @@ pub fn login(key: &str) -> i32 {
     }
     systemctl_quiet(&["start", "--no-block", "sso-guard.service"]);
     i32::from(!ok)
+}
+
+/// `ccflip login <key>...`: every named account at once. `aws` alone =
+/// every listed AWS sso-session that needs it (`SSO_GUARD_SESSIONS`).
+pub fn login_many(keys: &[String]) -> i32 {
+    let ok: Vec<bool> = std::thread::scope(|sc| {
+        let jobs: Vec<_> = keys
+            .iter()
+            .map(|k| {
+                sc.spawn(move || match k.as_str() {
+                    "aws" => aws::login_listed() == 0,
+                    _ => login(k) == 0,
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .map(|j| j.join().unwrap_or(false))
+            .collect()
+    });
+    for (k, ok) in keys.iter().zip(&ok) {
+        println!("ccflip: {k} {}", if *ok { "ok" } else { "FAILED" });
+    }
+    i32::from(ok.contains(&false))
 }
 
 /// A login that needs a human: one persistent notification, login on

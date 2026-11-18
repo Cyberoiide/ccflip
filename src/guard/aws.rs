@@ -150,100 +150,134 @@ impl Provider for Aws {
     }
 }
 
+/// Sessions kept alive for good, browser login included, and the ones
+/// `ccflip login aws` logs in to (space-separated; "*" = all). The others
+/// are re-logged only while in use: an org that caps sessions at 1h would
+/// otherwise mean a browser tab per hour for a session nothing needs — the
+/// `aws` shim logs those in on demand. SSO_GUARD_BROWSER is the old name.
+fn listed(policy: &crate::policy::Policy) -> String {
+    policy
+        .text("SSO_GUARD_SESSIONS")
+        .or_else(|| policy.text("SSO_GUARD_BROWSER"))
+        .unwrap_or_else(|| "*".to_string())
+}
+
 fn check(aws: &Aws, run: &mut Run) {
-    // Sessions allowed to open a browser login when their IdC session ends
-    // (space-separated; "*" = all). Others are re-logged only while in use:
-    // an org that caps sessions at 1h would otherwise mean a login per hour
-    // for a session nothing needs.
-    let browser = run
-        .policy
-        .text("SSO_GUARD_BROWSER")
-        .unwrap_or_else(|| "*".to_string());
+    let browser = listed(&run.policy);
     let graphical = graphical();
     let cache = cache_dir();
+    let sessions = configured_sessions();
+    // One thread per session: a browser login can block ~10 min and must
+    // never delay the others. Each works on its own fork of the run.
+    let forks: Vec<Run> = std::thread::scope(|sc| {
+        let jobs: Vec<_> = sessions
+            .iter()
+            .map(|s| {
+                let mut fork = run.fork();
+                let (browser, cache) = (&browser, &cache);
+                sc.spawn(move || {
+                    check_session(aws, s, &mut fork, browser, graphical, cache);
+                    fork
+                })
+            })
+            .collect();
+        jobs.into_iter().filter_map(|j| j.join().ok()).collect()
+    });
+    for fork in forks {
+        run.join(fork);
+    }
+}
 
-    for s in configured_sessions() {
-        let name = s.name.as_str();
+/// One session's keep-alive pass.
+fn check_session(
+    aws: &Aws,
+    s: &Session,
+    run: &mut Run,
+    browser: &str,
+    graphical: bool,
+    cache: &Path,
+) {
+    let cache = cache.to_path_buf();
+    let name = s.name.as_str();
+    let e = expiry_for(&cache, &s.start_url);
+    // +90s slack: the re-arm wakes 60s before the threshold, so act now
+    // instead of sleeping 1 more minute and waking again.
+    if e - run.now > run.min_seconds + 90 {
+        clear_needs_you(aws, name);
+        run.track(e);
+        return;
+    }
+
+    // Decide before spending a refresh call on a dead, unused session.
+    let gated = browser != "*" && !browser.split_whitespace().any(|b| b == name);
+    let why = if gated {
+        in_use(s).or_else(|| used_recently(s))
+    } else {
+        None
+    };
+    if gated && why.is_none() && e <= run.now {
+        println!(
+            "sso-guard: {name} expired, unused, letting it lapse (aws sso login --sso-session {name})"
+        );
+        return;
+    }
+
+    if refresh(&cache, &s.start_url) {
         let e = expiry_for(&cache, &s.start_url);
-        // +90s slack: the re-arm wakes 60s before the threshold, so act now
-        // instead of sleeping 1 more minute and waking again.
-        if e - run.now > run.min_seconds + 90 {
-            clear_needs_you(aws, name);
+        // A full refresh buys ~60 min. Less means the IdC session itself
+        // ends at `e`: refreshes or a browser login before then reuse that
+        // same session and buy nothing, so sleep until it ends.
+        if e - run.now > 3000 {
+            println!("sso-guard: {name} access token refreshed silently");
             run.track(e);
-            continue;
-        }
-
-        // Decide before spending a refresh call on a dead, unused session.
-        let gated = browser != "*" && !browser.split_whitespace().any(|b| b == name);
-        let why = if gated {
-            in_use(&s).or_else(|| used_recently(&s))
         } else {
-            None
-        };
-        if gated && why.is_none() && e <= run.now {
+            println!("sso-guard: {name} session ends {}, login then", clock(e));
+            run.want(e + 30);
+        }
+        return;
+    }
+
+    if gated {
+        let Some(why) = why else {
             println!(
-                "sso-guard: {name} expired, unused, letting it lapse (aws sso login --sso-session {name})"
+                "sso-guard: {name} session over, unused, letting it lapse (aws sso login --sso-session {name})"
             );
-            continue;
-        }
+            return;
+        };
+        println!("sso-guard: {name} in use ({why}), re-login");
+    }
 
-        if refresh(&cache, &s.start_url) {
-            let e = expiry_for(&cache, &s.start_url);
-            // A full refresh buys ~60 min. Less means the IdC session itself
-            // ends at `e`: refreshes or a browser login before then reuse that
-            // same session and buy nothing, so sleep until it ends.
-            if e - run.now > 3000 {
-                println!("sso-guard: {name} access token refreshed silently");
-                run.track(e);
-            } else {
-                println!("sso-guard: {name} session ends {}, login then", clock(e));
-                run.want(e + 30);
-            }
-            continue;
-        }
-
-        if gated {
-            let Some(why) = why else {
-                println!(
-                    "sso-guard: {name} session over, unused, letting it lapse (aws sso login --sso-session {name})"
-                );
-                continue;
-            };
-            println!("sso-guard: {name} in use ({why}), re-login");
-        }
-
-        if !graphical {
-            eprintln!(
-                "sso-guard: '{name}' needs interactive login (no display): aws sso login --sso-session {name}"
-            );
-            run.failed = true;
-        } else if needs_you(aws, name).exists() {
-            ask_login(aws, name);
+    if !graphical {
+        eprintln!(
+            "sso-guard: '{name}' needs interactive login (no display): aws sso login --sso-session {name}"
+        );
+        run.failed = true;
+    } else if needs_you(aws, name).exists() {
+        ask_login(aws, name);
+    } else {
+        // Held through the login: an on-demand caller waits for it
+        // instead of opening a second tab.
+        let lock = lock_file(aws, name);
+        if lock.as_ref().is_some_and(|l| l.try_lock().is_err()) {
+            println!("sso-guard: {name} login already in progress (aws shim)");
+            run.want(run.now + 120);
+        } else if aws.login(name) {
+            // One click-free browser attempt worked.
+            run.track(expiry_for(&cache, &s.start_url));
         } else {
-            // Held through the login: an on-demand caller waits for it
-            // instead of opening a second tab.
-            let lock = lock_file(aws, name);
-            if lock.as_ref().is_some_and(|l| l.try_lock().is_err()) {
-                println!("sso-guard: {name} login already in progress (aws shim)");
-                run.want(run.now + 120);
-            } else if aws.login(name) {
-                // One click-free browser attempt worked.
-                run.track(expiry_for(&cache, &s.start_url));
-            } else {
-                // Timed out: the browser IdP session is gone too. Ask once via
-                // a notification instead of opening a new tab on every run.
-                println!(
-                    "sso-guard: {name} browser login timed out, asking via notification instead of reopening the browser"
-                );
-                let _ = fs::write(needs_you(aws, name), "");
-                ask_login(aws, name);
-            }
+            // Timed out: the browser IdP session is gone too. Ask once via
+            // a notification instead of opening a new tab on every run.
+            println!(
+                "sso-guard: {name} browser login timed out, asking via notification instead of reopening the browser"
+            );
+            let _ = fs::write(needs_you(aws, name), "");
+            ask_login(aws, name);
         }
     }
 }
 
 /// `aws` shim (ccflip symlinked as `aws`, ahead of the real one on PATH).
-/// A session outside `SSO_GUARD_BROWSER` lapses while unused — after every
+/// A session outside `SSO_GUARD_SESSIONS` lapses while unused — after every
 /// break, under a 1h IdC cap. So when this call's profile belongs to an
 /// sso-session whose token has expired, [`ensure`] it first; then the real
 /// aws runs. Covers whatever spawns `aws` from a shell PATH: kubectl's
@@ -334,16 +368,86 @@ fn ensure(s: &Session, aws: &Path) -> bool {
         return false;
     }
     eprintln!("sso-guard: {name} session over, logging in (browser)");
-    // stderr only: kubectl parses get-token's stdout as JSON.
-    let ok = Command::new(aws)
-        .args(["sso", "login", "--sso-session", name])
-        .stdout(Stdio::from(std::io::stderr()))
-        .status()
-        .is_ok_and(|st| st.success());
+    let ok = login_via_file(aws, name);
     if ok {
         clear_needs_you(&Aws, name);
     }
     ok
+}
+
+/// `aws sso login`, its output streamed to our stderr (kubectl parses
+/// get-token's stdout as JSON) through a file: the browser aws spawns
+/// inherits its fds and can linger for minutes, and a caller reading our
+/// stderr through a pipe (a script, an agent's shell) must not wait on it.
+fn login_via_file(aws: &Path, name: &str) -> bool {
+    // Fixed name: the session lock already serialises logins per session.
+    let path = super::state_dir().join(format!("aws.{}.login.log", name.replace('/', "_")));
+    let Ok(out) = fs::File::create(&path) else {
+        return false;
+    };
+    let (Ok(err), Ok(mut tail)) = (out.try_clone(), fs::File::open(&path)) else {
+        return false;
+    };
+    let child = Command::new(aws)
+        .args(["sso", "login", "--sso-session", name])
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err)
+        .spawn();
+    let ok = child.is_ok_and(|mut child| {
+        let mut stderr = std::io::stderr();
+        loop {
+            let done = child.try_wait();
+            let _ = std::io::copy(&mut tail, &mut stderr); // drained after exit too
+            match done {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+                Err(_) => break false,
+            }
+        }
+    });
+    let _ = fs::remove_file(&path);
+    ok
+}
+
+/// `ccflip login aws`: every listed session made usable now, all at once
+/// (refresh, else one click-free browser login), reported per session.
+pub fn login_listed() -> i32 {
+    let list = listed(&crate::policy::read());
+    let configured = configured_sessions();
+    let names: Vec<String> = if list == "*" {
+        configured.iter().map(|s| s.name.clone()).collect()
+    } else {
+        list.split_whitespace().map(String::from).collect()
+    };
+    let real = crate::launch::real_program("aws");
+    let ok: Vec<bool> = std::thread::scope(|sc| {
+        let jobs: Vec<_> = names
+            .iter()
+            .map(|n| {
+                let (configured, real) = (&configured, &real);
+                sc.spawn(move || match configured.iter().find(|s| &s.name == n) {
+                    Some(s) => ensure(s, real),
+                    None => {
+                        eprintln!(
+                            "sso-guard: no sso-session '{n}' in {}",
+                            config_path().display()
+                        );
+                        false
+                    }
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .map(|j| j.join().unwrap_or(false))
+            .collect()
+    });
+    for (n, ok) in names.iter().zip(&ok) {
+        println!("sso-guard: {n} {}", if *ok { "ok" } else { "FAILED" });
+    }
+    // Re-arm the timer from the new tokens.
+    super::systemctl_quiet(&["start", "--no-block", "sso-guard.service"]);
+    i32::from(ok.contains(&false))
 }
 
 fn graphical() -> bool {

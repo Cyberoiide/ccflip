@@ -44,6 +44,15 @@ case by case against the bash versions (see Testing).
   before the call that needs it, then runs the real `aws`. One lock per
   session is shared with the timer, so bursts (k9s) open one tab. Ends the
   manual `aws sso login` after every break under a 1h Identity Center cap.
+- `SSO_GUARD_SESSIONS` (old name `SSO_GUARD_BROWSER`, still read): the
+  sessions kept alive for good. Every session is checked in its own thread,
+  so a browser login waiting ~10 min never delays the others.
+- `ccflip login` takes several accounts and logs in to them at once;
+  `ccflip login aws` = every listed SSO session that needs it (the bash
+  `sso-guard login`). A bare `ccflip login` stays a claude prompt.
+- An on-demand login streams `aws sso login` through a file: the browser it
+  spawns inherits the fds, and a caller reading stderr through a pipe waited
+  on it for minutes.
 
 ### CLI
 

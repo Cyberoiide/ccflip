@@ -63,8 +63,10 @@ enum Cmd {
     Status,
     /// Log in to one guarded account, named as in `ccflip status`
     Login {
-        /// `<provider>.<account>`, e.g. aws.heka or gcloud.me@example.com
-        account: String,
+        /// `<provider>.<account>` (aws.heka, gcloud.me@example.com), all at
+        /// once; plain `aws` = every SSO_GUARD_SESSIONS session that needs it
+        #[arg(required = true)]
+        accounts: Vec<String>,
     },
     /// Live dashboard: guarded credentials and Claude accounts
     Ui,
@@ -140,7 +142,7 @@ fn main() {
         Some(Cmd::Watch) => watch::run(),
         Some(Cmd::SsoGuard) => std::process::exit(guard::run()),
         Some(Cmd::Status) => guard::status(),
-        Some(Cmd::Login { account }) => std::process::exit(guard::login(&account)),
+        Some(Cmd::Login { accounts }) => std::process::exit(guard::login_many(&accounts)),
         Some(Cmd::Ui) => exit_on_err(ui::run()),
         Some(Cmd::Statusline) => statusline(),
         Some(Cmd::Install) => exit_on_err(install::run()),
