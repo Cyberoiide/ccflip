@@ -24,7 +24,9 @@ cat > "$HOME/.local/bin/aws" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >> "$CALLS"
 case "$*" in
-  *create-token*) exit 1 ;; # every IdC session is over
+  *create-token*) # every IdC session is over, or the network is down
+    [[ -n "${OFFLINE:-}" ]] && echo 'aws: [ERROR]: Could not connect to the endpoint URL: "https://x/token"' >&2
+    exit 1 ;;
   "sso login --sso-session "*)
     s=${!#}; sleep 2
     # Like a browser: a child that inherits our fds and outlives the login.
@@ -56,7 +58,7 @@ expire() { # every session's token expired 5 min ago, refresh token dead
     done
 }
 reset() { : > "$CALLS"; rm -rf "$XDG_STATE_HOME"; rm -f "$CCFLIP_POLICY"; expire
-          unset SSO_GUARD_SESSIONS SSO_GUARD_BROWSER LOGIN_FAIL TIMER_RC LINGER; export DISPLAY=:0; }
+          unset SSO_GUARD_SESSIONS SSO_GUARD_BROWSER LOGIN_FAIL TIMER_RC LINGER OFFLINE; export DISPLAY=:0; }
 logins() { grep -c "^sso login" "$CALLS" || true; }
 fail() { echo "FAIL: $*"; echo "--- calls"; cat "$CALLS"; exit 1; }
 timed() { local t0=$SECONDS r=0; "$@" || r=$?; elapsed=$(( SECONDS - t0 )); return "$r"; }
@@ -93,6 +95,15 @@ bin/sso-guard login strat >/dev/null 2>&1 || fail "login while sso-off"
 bin/sso-guard login strat >/dev/null 2>&1
 [[ $(logins) == 1 ]] || fail "second login of a fresh session: $(logins)"
 bin/sso-guard login nope >/dev/null 2>&1 && fail "unknown session should fail"
+
+# Offline (resume before Wi-Fi is back): no browser tab, retry in 1 min.
+reset; echo 'SSO_GUARD_SESSIONS="heka strat"' > "$CCFLIP_POLICY"; export OFFLINE=1
+out=$(bin/sso-guard)
+[[ $(logins) == 0 ]] || fail "offline guard opened $(logins) tabs"
+grep -q "strat: no network, retry in 1 min" <<<"$out" && grep -q "next check in 1 min" <<<"$out" || fail "offline: $out"
+bin/sso-guard login strat >/dev/null 2>&1 && fail "offline login should fail"
+[[ $(logins) == 0 ]] || fail "offline login opened a tab"
+[[ ! -e "$XDG_STATE_HOME/sso-guard/strat.needs-you" ]] || fail "offline marked needs-you"
 
 # A lingering browser must not hold a caller's stderr pipe open.
 reset; export LINGER=1
