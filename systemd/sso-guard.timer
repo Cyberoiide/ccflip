@@ -1,5 +1,5 @@
 [Unit]
-Description=AWS SSO freshness backstop (sso-guard re-arms itself adaptively)
+Description=Credential freshness backstop (sso-guard re-arms itself adaptively)
 
 [Timer]
 OnStartupSec=2min

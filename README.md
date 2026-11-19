@@ -5,6 +5,30 @@ Thin glue around [claude-swap](https://github.com/realiti4/claude-swap) —
 everything account-shaped is upstream; this repo only adds the Bedrock tier,
 a pinned-session watcher, and a statusline chip.
 
+One static Rust binary, nine subcommands:
+
+| Command | Does |
+|---------|------|
+| `ccflip [args…]` | route to the right account, exec `claude` (args pass through) |
+| `ccflip bedrock [args…]` | force the Bedrock tier for this launch |
+| `ccflip budget` | real dollar meters + this host's Bedrock consumption |
+| `ccflip who` | account of every running claude session (PID, account, cwd) |
+| `ccflip watch` | rotation, mid-session tier switching, policy guard, alerts (systemd unit) |
+| `ccflip sso-guard` | keep AWS SSO / gcloud credentials fresh (systemd, adaptive) |
+| `ccflip status` | every guarded account (AWS SSO, gcloud) and its state, as JSON |
+| `ccflip login <provider>.<account>...` | log in to guarded accounts at once (`aws.heka`, `gcloud.me@x.com`); `ccflip login aws` = every listed SSO session |
+| `ccflip ui` | live terminal dashboard: credentials + Claude accounts (works over SSH) |
+| `ccflip statusline` | print the account chip for the statusline |
+| `ccflip install` | claude-swap + systemd units on this host |
+| `ccflip update` | replace itself with the latest GitHub release |
+
+ccflip is a drop-in claude binary, so it reserves no flags: `--help` and
+`--version` reach claude, and a subcommand above is taken only when it
+parses exactly (`ccflip who am i`, `ccflip login` alone are prompts). The
+parser is clap; `ccflip help` is its generated help. `bedrock` takes claude
+args verbatim, so it is matched as the first word. `ccflip -- <word>`
+forces any reserved word through.
+
 ## What it does
 
 | Where | Tier order |
@@ -28,7 +52,7 @@ Three moving parts:
 - **`cswap auto`** (upstream, systemd unit) — rotates the *default* login
   before it hits a limit. Covers every plain `claude` launch, including
   t3code-spawned sessions — t3code needs no changes and sees nothing.
-- **`ccflip-watch`** (systemd unit) — upstream auto deliberately skips
+- **`ccflip watch`** (systemd unit) — upstream auto deliberately skips
   accounts owned by live pinned sessions, so this watcher rotates *pinned
   session profiles*: when a session's account exhausts a window, the best
   remaining account's credentials are written into that session's
@@ -41,8 +65,18 @@ be injected into a running process. Bedrock engages at (re)launch only.
 ## Install
 
 ```bash
-./install.sh
+# fast: prebuilt static binary from the latest GitHub release
+cargo binstall --git https://github.com/Cyberoiide/ccflip ccflip
+
+# or compile from source
+cargo install --git https://github.com/Cyberoiide/ccflip
+
+# then set the host up (claude-swap, systemd units)
+ccflip install
 ```
+
+Update later with `ccflip update` (set `GITHUB_TOKEN` while the repo is
+private) or by re-running the install command.
 
 Then on each host:
 
@@ -54,11 +88,13 @@ Then on each host:
    covers darkfindr and siblings.
 3. `cp bedrock.env.example ~/.claude/bedrock.env`, keep the block for this
    host (dellpro: SSO profile; claude-host: instance role, no `AWS_PROFILE`).
+   Plain `KEY=VALUE` / `export KEY=VALUE` lines only — ccflip reads it
+   directly, it is not run through a shell.
 4. Optional statusline (shows `[model] account-in-use`), in
    `~/.claude/settings.json`:
 
    ```json
-   { "statusLine": { "type": "command", "command": "~/.local/bin/ccflip-statusline" },
+   { "statusLine": { "type": "command", "command": "ccflip statusline" },
      "awsAuthRefresh": "aws sso login --profile code-assist-admin" }
    ```
 
@@ -67,7 +103,7 @@ Launch with `ccflip` in terminals. t3code keeps launching plain `claude`.
 ## t3code integration
 
 t3code resolves its claude binary from a per-environment **binary path**
-setting (Settings → Claude). Point it at `~/.local/bin/ccflip` on every
+setting (Settings → Claude). Point it at `~/.cargo/bin/ccflip` on every
 machine (the local app and each `npx t3 connect` host are separate
 environments with separate settings). t3code spawns per session with the
 workspace as cwd, so dir-pinning and the Bedrock tier apply; settings-wise
@@ -88,15 +124,49 @@ Policy routing is the default; explicit picks are always available:
   account, this terminal only. (From a fresh shell — a stale
   `CLAUDE_CODE_USE_BEDROCK` poisons cswap's validation probe.)
 
-## The claude shim
+## Shimming `claude`
 
-Some spawners can't be pointed at ccflip (t3code's remote server ignores
-the desktop app's binary path). `bin/claude-shim`, installed as `claude`
-in a PATH dir that precedes the real binary (e.g. `~/.npm-global/bin`),
-routes any bare `claude` invocation through ccflip. It passes straight
-through to the real binary when the caller already chose: `CCFLIP_ROUTED`
-(ccflip descendants), `CLAUDE_CONFIG_DIR` (a `cswap run` session), or
-`CLAUDE_CODE_USE_BEDROCK` (forced Bedrock).
+Some spawners can't be pointed at ccflip (t3code's remote server ignores the
+desktop app's binary path). Symlink `claude` at ccflip somewhere earlier in
+their PATH and every bare `claude` invocation routes — the binary is its own
+shim, no wrapper script:
+
+```bash
+ln -sf ~/.cargo/bin/ccflip ~/.npm-global/bin/claude
+```
+
+It stands aside when the caller already chose: `CCFLIP_ROUTED` (ccflip's own
+descendants — cswap re-resolves `claude`, and this is what stops the loop),
+`CLAUDE_CONFIG_DIR` (a `cswap run` session), or `CLAUDE_CODE_USE_BEDROCK`
+(forced Bedrock).
+
+## Mid-session tier switching
+
+Credential rotation covers subscription→subscription, but Bedrock needs env
+vars a live process cannot receive. The conversation is the session id, not
+the process: SDK harnesses (t3code, claude-mem) respawn a killed process on
+the next message with the same session. So `ccflip watch` ends a
+**harness-spawned** process whose account is exhausted with no rotation
+target — its requests were failing anyway — and it revives on Bedrock; a
+Bedrock process is ended once its subscription tier is usable again and its
+transcript has been idle for `CCFLIP_SWITCHBACK_IDLE` (300s), reviving on the
+account.
+
+Nothing is ended unless it can land somewhere better: a session is left alone
+when a rotation target exists, when account health is unknown (a cswap poll
+gap is not evidence), when its transcript is active or unverifiable, and when
+the host has no `bedrock.env` at all — killing that one would just respawn
+onto the same exhausted account forever. Terminal sessions are never touched,
+nor are processes younger than `CCFLIP_PROC_MIN_AGE` (120s), nor sessions that
+already chose their tier (`ccflip bedrock` marks them).
+
+Opt out per process by exporting `CCFLIP_NO_TIER_SWITCH=1` in the caller's
+environment — for a batch `claude -p` that no harness would respawn — or
+set it for the watcher itself to disable the mechanism entirely; rotation,
+policy and alerts keep running either way.
+
+A mapped dir's pinned profile is kept across the Bedrock tier, so history
+resumes when a session moves between tiers.
 
 ## Seeing which account is in use
 
@@ -137,34 +207,124 @@ cswap polls it but never acts on it. ccflip does, at two lines:
 
 Set either in the environment or in `policy.env`.
 
-## SSO freshness (hosts using an AWS profile)
+## Freshly-hit limits
 
-`sso-guard` + its timer keep the SSO session alive so the Bedrock tier never
-dies with "Token is expired": every 15 min it silently renews the access
-token via the SSO refresh token when under `SSO_GUARD_MIN_MINUTES` (45)
-left, and opens the one-click browser login only when the Identity Center
-session itself has died. Not needed on instance-role hosts. Claude Code's
-own `awsAuthRefresh` setting stays as the in-session belt.
+cswap's polled usage lags a real limit by minutes — an exhausted account polls
+on backoff — so a revived session used to land straight back on the account
+that just refused it. The definitive signal is the error Claude Code wrote
+into the transcript, so `ccflip watch` scans transcripts touched in the last
+`CCFLIP_LIMIT_FRESH_SECS` (120) and flags the account that hit a limit
+unusable for `CCFLIP_LIMIT_FLAG_TTL` (900s) in
+`~/.local/state/ccflip/limit-flags.json` (`CCFLIP_LIMIT_FLAGS`). Every
+selection path honours the flag — launcher, alternates, rotation targets, tier
+switching — because it rides on the account itself. Switch-to-Bedrock latency
+drops from minutes to one tick.
 
-**Session list.** `SSO_GUARD_SESSIONS` (space-separated `[sso-session]`
-names, default `*` for all) lists the sessions kept alive for good, browser
-login included. Set it in `~/.config/ccflip/policy.env` so the timer, the
-shim and your shell all read the same value; the environment still wins.
-`SSO_GUARD_BROWSER` is the old name. Sessions are checked in parallel, so one
-login waiting ~10 min on the browser never delays the others.
-`sso-guard login [session...]` logs in to every listed session at once and
-reports `ok`/`FAILED` per session. It works even while `sso-off`.
+A flag is only raised by a line Claude Code marked as an API error
+(`isApiErrorMessage` / `apiErrorStatus`) whose text carries the limit phrase.
+Matching the phrase alone would fire on any session that merely *discusses*
+limits and push healthy work onto the paid tier for nothing.
 
-**On-demand login (`bin/aws` shim).** Sessions outside `SSO_GUARD_SESSIONS`
-lapse while unused. With a 1h Identity Center cap, that means after every
-break. Link `bin/aws` as `~/.local/bin/aws`, ahead of the real `aws` on PATH.
-When a command's profile belongs to an sso-session whose token has expired,
-the shim runs `sso-guard ensure <session>` first. That refreshes the token
-silently, or runs the click-free browser login, behind one lock so parallel
-callers like k9s open a single tab. Then the real `aws` runs. kubectl's
-`aws eks get-token`, ssm tunnels and plain `aws` calls stop failing with
-"Token has expired" after a break. Tools that read the SSO cache without
-spawning `aws` (Terraform, boto3 scripts) don't get this.
+## Credential keep-alive: AWS SSO, gcloud
+
+`ccflip sso-guard` keeps cloud CLI credentials alive so the Bedrock tier (and
+kubectl, tunnels, gcloud…) never dies with "Token is expired". Each provider
+is a module behind one small trait (`src/guard.rs`); adding one = one module
+plus one line in `PROVIDERS`.
+
+`ccflip status` prints every account as JSON — the contract a UI will read:
+
+```json
+[{ "provider": "aws", "account": "heka", "state": "ok",
+   "expires_at": "2026-11-11T18:00:00Z", "needs_you": false },
+ { "provider": "gcloud", "account": "me@example.com", "state": "expired",
+   "needs_you": true }]
+```
+
+`state` is `ok`, `expiring` (renewed on the next run), `expired` or `error`
+(could not tell; retried). `needs_you`: a login only a human can finish is
+pending, and a notification is up.
+
+`ccflip ui` shows the same rows live (plus the Claude accounts cswap knows:
+5h / 7d / spend, health), refreshed every minute and over SSH too:
+`↑↓` select, `l` log in to the selected account, `r` refresh, `q` quit.
+`ccflip login <provider>.<account>` does the same login from a script.
+
+### AWS IAM Identity Center
+
+Per `[sso-session]` in `~/.aws/config` that some profile uses:
+
+1. Token healthy: nothing; the next run is armed ~1 min before it drops under
+   `SSO_GUARD_MIN_MINUTES` (default 15).
+2. Token low: the cached SSO refresh token is redeemed directly (OIDC
+   `CreateToken`, no browser) and written back to the CLI cache. A refresh
+   that buys under 50 min means the Identity Center session itself ends then:
+   it sleeps until that end instead of retrying every minute.
+3. Session over: one browser login, click-free while the browser is still
+   signed in. If that times out, one persistent notification ("click to log
+   in") instead of a new tab every run; dismissed, it asks again after 2 h.
+
+`SSO_GUARD_SESSIONS` (space-separated session names, default `*` = all; the
+old name `SSO_GUARD_BROWSER` still works) lists the sessions kept alive for
+good, browser login included. Sessions are checked in parallel, so one login
+waiting ~10 min on the browser never delays the others. `ccflip login aws`
+makes every listed session usable at once (refresh, else one click-free
+login), prints `ok`/`FAILED` per session, and works while `sso-off`. A refresh
+call that can't reach AWS (resume, before Wi-Fi is back) opens no tab: the
+guard retries in 1 min. The
+unlisted sessions are kept alive silently and re-logged only while something
+uses them: a process with
+`--profile P` / `AWS_PROFILE=P`, or role credentials minted for one of its
+accounts in the last 65 min. Unused, they lapse quietly — log in on demand.
+It never changes Identity Center settings: session length is the org's policy.
+
+**On-demand login.** With a 1h Identity Center cap, "unused" means the
+session dies during every break. Symlink the binary as `aws` ahead of the
+real CLI:
+
+```bash
+ln -sf "$(command -v ccflip)" ~/.local/bin/aws
+```
+
+When a call's profile (`--profile`, `AWS_PROFILE`) belongs to an
+sso-session whose token has expired, ccflip first refreshes it silently, or
+runs the click-free browser login, behind a per-session lock shared with the
+timer. Then it runs the real `aws`. kubectl's `aws eks get-token`, ssm
+tunnels and scripts stop failing with "Token has expired" after a break.
+Login output goes to stderr, because kubectl parses stdout, and through a file:
+the browser `aws` spawns can linger for minutes, and a caller reading stderr
+through a pipe must not wait on it. Logins,
+`configure`, env-key calls and non-SSO profiles pass straight through. Tools
+that read the SSO cache without spawning `aws` (Terraform, boto3) aren't
+covered.
+
+### gcloud
+
+Every `gcloud auth list` account, plus application-default credentials when
+`application_default_credentials.json` exists. gcloud renews its own access
+tokens from a long-lived refresh token, so there is nothing to renew ahead;
+each run asks gcloud for a token and notices a refresh token that died
+(revoked, password change, Workspace session control). For the active account
+and ADC that posts the same "click to log in" notification; other accounts are
+only reported. It never opens a browser unasked, and a network failure never
+bothers you.
+
+### Knobs and scheduling
+
+Knobs live in `~/.config/ccflip/policy.env` (the environment still wins), so
+reinstalling the units never loses them:
+
+```bash
+SSO_GUARD_SESSIONS="heka stratumn"
+SSO_GUARD_MIN_MINUTES=15
+```
+
+A oneshot `sso-guard.service`, re-armed adaptively through a transient
+`sso-guard-next` timer; the hourly `sso-guard.timer` is the reboot-safe
+backstop and gcloud's poll. Disabling it (`sso-off`) stops everything.
+`ccflip install` enables it only where `~/.aws/config` exists — instance-role
+hosts have nothing to guard. Claude Code's own `awsAuthRefresh` setting stays
+as the in-session belt.
 
 ## Gotchas
 
@@ -196,6 +356,52 @@ spawning `aws` (Terraform, boto3 scripts) don't get this.
 `~/.local/share/claude-swap/sessions/<n-email>/projects/…` — the path IS the
 account, so per-account attribution is a matter of pointing tokscale at each
 profile dir.
+
+## Development
+
+```bash
+cargo test          # unit tests + routing/watcher e2e against fakes
+cargo clippy --all-targets -- -D warnings
+```
+
+Nothing in the suite touches real accounts, credentials, the installed
+binary or the running systemd units: the integration tests put fake
+`cswap`/`claude` scripts first on `PATH` and pin `HOME`, `XDG_DATA_HOME`,
+`CCFLIP_MAPPINGS`, `CCFLIP_BEDROCK_ENV` and `CCFLIP_POLICY` into a tempdir.
+The watcher runs one tick with `CCFLIP_WATCH_ONCE=1` and
+`CCFLIP_NO_TIER_SWITCH=1`, so it never signals a live process.
+
+`cargo test -- --ignored` additionally runs the destructive path for real:
+it spawns a `claude`-named process under a node parent and checks the watcher
+ends it (failover, switchback) or spares it (no Bedrock tier, opted out).
+That one scans the whole process table, so it is opt-in — on a box with live
+sessions a fixture account could match one of them.
+
+To try a build against real state without disturbing the installed setup,
+run the worktree binary directly. `CCFLIP_DRY_RUN=1` prints the tier and
+account a launch WOULD use and exits, so routing can be checked against real
+accounts without starting a session or spending anything:
+
+```bash
+CCFLIP_DRY_RUN=1 ccflip -p x     # -> "would launch: subscription via cswap run (...)"
+```
+
+Read-only commands (`ccflip who`, `ccflip budget`, `ccflip statusline`) are
+safe as-is, and for the rest point the seams at copies:
+
+```bash
+try=$(mktemp -d)   # private: bedrock.env reaches claude's environment
+CCFLIP_MAPPINGS=$try/mappings.json CCFLIP_BEDROCK_ENV=$try/bedrock.env \
+  ./target/debug/ccflip -p hello
+XDG_DATA_HOME=$try CCFLIP_POLICY=$try/policy.env \
+  CCFLIP_WATCH_ONCE=1 CCFLIP_NO_TIER_SWITCH=1 ./target/debug/ccflip watch
+```
+
+The installed `ccflip-watch.service` is untouched by either.
+
+Releasing: bump `version` in `Cargo.toml`, tag `vX.Y.Z`, push the tag —
+CI builds the static musl binary and publishes the GitHub release that
+`ccflip update` and cargo-binstall consume.
 
 ## ToS note
 

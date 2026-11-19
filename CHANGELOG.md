@@ -1,5 +1,92 @@
 # Changelog
 
+## v2.0.0 — unreleased
+
+Rewrite in Rust: one static binary (`ccflip`, plus `watch`, `sso-guard`,
+`statusline`, `install`, `update`) replaces `bin/ccflip`, `bin/ccflip-watch`,
+`bin/claude-shim`, `bin/sso-guard`, `statusline.sh` and `install.sh`.
+Behaviour is the v1.0.0 behaviour plus everything on master since, checked
+case by case against the bash versions (see Testing).
+
+### Breaking
+
+- `~/.claude/bedrock.env` is parsed as plain `KEY=VALUE` lines (an optional
+  leading `export` is accepted) instead of being sourced by a shell.
+- Install via `cargo binstall` or a GitHub release; `ccflip install` writes the
+  systemd units pointing at the binary. `sso-guard.service` is now
+  `ExecStart=<binary> sso-guard`: hand-written units must be updated.
+- Per-host sso-guard knobs (`SSO_GUARD_BROWSER`, `SSO_GUARD_MIN_MINUTES`)
+  move to `~/.config/ccflip/policy.env` (the environment still wins), so
+  reinstalling the units keeps them.
+- sso-guard state markers are named `<provider>.<account>.needs-you`
+  (`aws.heka.needs-you`); an old `heka.needs-you` is ignored, costing at most
+  one extra click-free browser try.
+- The `claude` shim is a symlink to the binary (`ln -sf "$(command -v ccflip)"
+  ~/.local/bin/claude`) instead of a script.
+
+### Credential keep-alive (sso-guard)
+
+- A provider framework: `src/guard.rs` holds the `Provider` trait (`check`,
+  `status`, `login`), scheduling and the human-login notification; each
+  provider is one module listed in `PROVIDERS`.
+- AWS Identity Center (`src/guard/aws.rs`): same decisions as the bash
+  version (silent refresh, capped-session sleep, in-use gating, one browser
+  try then one notification).
+- gcloud (`src/guard/gcloud.rs`): every `gcloud auth list` account plus
+  application-default credentials; a dead refresh token posts the login
+  notification for the active account and ADC, never a browser unasked.
+- `ccflip status`: every account's state as JSON, the contract for a UI.
+- `ccflip ui` (ratatui): live terminal dashboard of the credentials and the
+  Claude accounts, works over SSH; `l` logs in to the selected account.
+- `ccflip login <provider>.<account>`: the same login from a script.
+- On-demand AWS login: symlinked as `aws` (ahead of the real CLI on PATH),
+  ccflip refreshes, or logs in click-free, an expired sso-session right
+  before the call that needs it, then runs the real `aws`. One lock per
+  session is shared with the timer, so bursts (k9s) open one tab. Ends the
+  manual `aws sso login` after every break under a 1h Identity Center cap.
+- `SSO_GUARD_SESSIONS` (old name `SSO_GUARD_BROWSER`, still read): the
+  sessions kept alive for good. Every session is checked in its own thread,
+  so a browser login waiting ~10 min never delays the others.
+- `ccflip login` takes several accounts and logs in to them at once;
+  `ccflip login aws` = every listed SSO session that needs it (the bash
+  `sso-guard login`). A bare `ccflip login` stays a claude prompt.
+- An on-demand login streams `aws sso login` through a file: the browser it
+  spawns inherits the fds, and a caller reading stderr through a pipe waited
+  on it for minutes.
+- No network is not a dead session: when the refresh call can't reach AWS
+  (resume, before Wi-Fi is back) the guard retries in 1 min and the shim
+  skips the login, instead of opening a tab that loads an error page and
+  times out 10 min later.
+
+### CLI
+
+- Subcommands are parsed by clap (generated `ccflip help`), still under the
+  drop-in rule: anything that does not parse exactly as ccflip's own command
+  passes through to claude, `--help`/`--version` included.
+- The refresh token is redeemed with a direct HTTPS call instead of
+  `aws sso-oidc create-token`: the refresh token and client secret no longer
+  appear in a command line any local user can read from `/proc`, and a run
+  no longer pays the AWS CLI's Python start-up.
+- A cache entry whose `region` is not a plain region name is never contacted
+  (the region becomes the host the secrets are posted to).
+
+### Routing
+
+- One shared account-selection implementation for the launcher and the
+  watcher (the bash version had three divergent jq programs).
+- setup-token accounts (usage `"unavailable"`) keep serving their own pinned
+  dir and sessions, as on master since v1.0.0.
+
+### Testing
+
+- `cargo test`: unit tests for every selection rule and parser, end-to-end
+  routing/watcher/sso-guard runs against fakes. `SSO_GUARD_ORACLE=<old
+  bin/sso-guard> cargo test --test sso_guard` replays every sso-guard
+  scenario against the bash version and fails on any differing decision.
+- `cargo test -- --ignored`: the real gcloud CLI's dead/offline errors, the
+  real AWS CLI reading the token cache we write, and the tier switcher signalling real processes (run it in a PID
+  namespace: `unshare -rpf --mount-proc cargo test -- --ignored`).
+
 ## v1.0.0 — 2026-09-06
 
 First tagged release. Per-project Claude Code account routing across two

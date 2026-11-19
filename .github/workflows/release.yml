@@ -1,0 +1,49 @@
+# Tag v* -> build a static musl binary -> GitHub release.
+# `ccflip update` and cargo-binstall both consume these assets; the name
+# must keep matching Cargo.toml's [package.metadata.binstall] pkg-url.
+#
+# Supply chain: the build (≈200 crates' build scripts) runs with a read-only
+# token and no cache; only the publish job, which runs no project code, can
+# write the release. Actions are pinned by commit.
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  ASSET: ccflip-x86_64-unknown-linux-musl.tgz
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup toolchain install stable --profile minimal
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: cargo test --locked
+      - run: cargo build --locked --release --target x86_64-unknown-linux-musl
+      - run: tar czf "$ASSET" -C target/x86_64-unknown-linux-musl/release ccflip
+      # aarch64: add a matrix entry on ubuntu-24.04-arm when a host needs it.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release
+          path: ${{ env.ASSET }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: ${{ env.ASSET }}
