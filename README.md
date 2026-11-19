@@ -269,7 +269,9 @@ old name `SSO_GUARD_BROWSER` still works) lists the sessions kept alive for
 good, browser login included. Sessions are checked in parallel, so one login
 waiting ~10 min on the browser never delays the others. `ccflip login aws`
 makes every listed session usable at once (refresh, else one click-free
-login), prints `ok`/`FAILED` per session, and works while `sso-off`. The
+login), prints `ok`/`FAILED` per session, and works while `sso-off`. A refresh
+call that can't reach AWS (resume, before Wi-Fi is back) opens no tab: the
+guard retries in 1 min. The
 unlisted sessions are kept alive silently and re-logged only while something
 uses them: a process with
 `--profile P` / `AWS_PROFILE=P`, or role credentials minted for one of its

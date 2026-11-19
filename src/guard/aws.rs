@@ -222,7 +222,13 @@ fn check_session(
         return;
     }
 
-    if refresh(&cache, &s.start_url) {
+    let refreshed = refresh(&cache, &s.start_url);
+    if refreshed == Refresh::Offline {
+        println!("sso-guard: {name}: no network, retry in 1 min");
+        run.want(run.now + 60);
+        return;
+    }
+    if refreshed == Refresh::Done {
         let e = expiry_for(&cache, &s.start_url);
         // A full refresh buys ~60 min. Less means the IdC session itself
         // ends at `e`: refreshes or a browser login before then reuse that
@@ -358,8 +364,16 @@ fn ensure(s: &Session, aws: &Path) -> bool {
     if lock.lock().is_err() {
         return false;
     }
-    if fresh() || (refresh(&cache, &s.start_url) && fresh()) {
-        return true; // another caller just logged in, or the session lives
+    if fresh() {
+        return true; // another caller just logged in
+    }
+    match refresh(&cache, &s.start_url) {
+        Refresh::Done if fresh() => return true,
+        Refresh::Offline => {
+            eprintln!("sso-guard: {name}: no network, not logging in");
+            return false;
+        }
+        _ => {}
     }
     if !graphical() {
         eprintln!(
@@ -531,44 +545,67 @@ fn expiry_for(cache: &Path, start_url: &str) -> i64 {
 /// does NOT do this: it is served from cached role creds and never touches
 /// the SSO token. Posting ourselves also keeps the refresh token and client
 /// secret out of argv, where any local user could read them.
-fn refresh(cache: &Path, start_url: &str) -> bool {
-    cache_entries(cache, start_url)
-        .into_iter()
-        .any(|(path, mut t)| {
-            let Some(r) = create_token(&t) else {
-                return false;
-            };
-            let Some(expires_at) = stamp(now() + r.expires_in) else {
-                return false;
-            };
-            t.access_token = Some(r.access_token);
-            if r.refresh_token.is_some() {
-                t.refresh_token = r.refresh_token;
+fn refresh(cache: &Path, start_url: &str) -> Refresh {
+    let mut out = Refresh::Dead;
+    for (path, mut t) in cache_entries(cache, start_url) {
+        let r = match create_token(&t) {
+            Ok(r) => r,
+            Err(e) => {
+                if e == Refresh::Offline {
+                    out = e;
+                }
+                continue;
             }
-            t.expires_at = Some(expires_at);
-            serde_json::to_vec(&t).is_ok_and(|data| write_private(&path, &data).is_ok())
-        })
+        };
+        let Some(expires_at) = stamp(now() + r.expires_in) else {
+            continue;
+        };
+        t.access_token = Some(r.access_token);
+        if r.refresh_token.is_some() {
+            t.refresh_token = r.refresh_token;
+        }
+        t.expires_at = Some(expires_at);
+        if serde_json::to_vec(&t).is_ok_and(|data| write_private(&path, &data).is_ok()) {
+            return Refresh::Done;
+        }
+    }
+    out
 }
 
-fn create_token(cached: &CachedToken) -> Option<NewToken> {
+/// A refresh attempt. Offline is not a dead session: right after resume the
+/// timer fires before Wi-Fi is back, and a browser tab opened then loads an
+/// error page and sits there until the login times out.
+#[derive(Debug, PartialEq)]
+enum Refresh {
+    Done,
+    Dead,
+    Offline,
+}
+
+fn create_token(cached: &CachedToken) -> Result<NewToken, Refresh> {
     fn field(f: &Option<String>) -> Option<&str> {
         f.as_deref().filter(|s| !s.is_empty())
     }
-    let (id, secret, refresh) = (
-        field(&cached.client_id)?,
-        field(&cached.client_secret)?,
-        field(&cached.refresh_token)?,
-    );
+    let (Some(id), Some(secret), Some(refresh)) = (
+        field(&cached.client_id),
+        field(&cached.client_secret),
+        field(&cached.refresh_token),
+    ) else {
+        return Err(Refresh::Dead);
+    };
     // The region becomes part of the host the secrets are posted to.
     let region = field(&cached.region).filter(|r| {
         r.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    })?;
+    });
+    let Some(region) = region else {
+        return Err(Refresh::Dead);
+    };
     // AWS_ENDPOINT_URL_SSO_OIDC: the SDK-standard override, as `aws` honours it.
     let base = env::var("AWS_ENDPOINT_URL_SSO_OIDC")
         .unwrap_or_else(|_| format!("https://oidc.{region}.amazonaws.com"));
     if !safe_endpoint(&base) {
-        return None;
+        return Err(Refresh::Dead);
     }
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
@@ -584,8 +621,17 @@ fn create_token(cached: &CachedToken) -> Option<NewToken> {
         .post(format!("{}/token", base.trim_end_matches('/')))
         .header("Content-Type", "application/json")
         .send(body.to_string())
-        .ok()?;
-    serde_json::from_str(&resp.body_mut().read_to_string().ok()?).ok()
+        .map_err(|e| match e {
+            // The IdC answered: the refresh token is dead.
+            ureq::Error::StatusCode(_) => Refresh::Dead,
+            // DNS, connect, TLS, timeout: never reached it.
+            _ => Refresh::Offline,
+        })?;
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|_| Refresh::Dead)?;
+    serde_json::from_str(&text).map_err(|_| Refresh::Dead)
 }
 
 /// The secrets go over TLS, or in clear only to this machine (tests, local

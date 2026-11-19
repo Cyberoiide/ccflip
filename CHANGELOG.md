@@ -53,6 +53,10 @@ case by case against the bash versions (see Testing).
 - An on-demand login streams `aws sso login` through a file: the browser it
   spawns inherits the fds, and a caller reading stderr through a pipe waited
   on it for minutes.
+- No network is not a dead session: when the refresh call can't reach AWS
+  (resume, before Wi-Fi is back) the guard retries in 1 min and the shim
+  skips the login, instead of opening a tab that loads an error page and
+  times out 10 min later.
 
 ### CLI
 

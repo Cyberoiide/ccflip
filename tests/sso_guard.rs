@@ -78,6 +78,11 @@ fn denied() -> Oidc {
     Oidc(400, r#"{"error":"invalid_grant"}"#.to_string())
 }
 
+/// Status 0: the connection drops unanswered, as with no network.
+fn offline() -> Oidc {
+    Oidc(0, String::new())
+}
+
 /// One-connection-at-a-time HTTP server; records every request body.
 fn serve(answer: Oidc) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -98,6 +103,9 @@ fn serve(answer: Oidc) -> (String, Arc<Mutex<Vec<String>>>) {
             let mut body = vec![0; len];
             reader.read_exact(&mut body).unwrap();
             log.lock().unwrap().push(String::from_utf8(body).unwrap());
+            if answer.0 == 0 {
+                continue; // dropped unanswered
+            }
             let reply = format!(
                 "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 answer.0,
@@ -254,7 +262,9 @@ esac
         r#"#!/usr/bin/env bash
 echo "aws $*" >> "$CALLS"
 case "$1 $2" in
-  "sso-oidc create-token") [[ "$OIDC_STATUS" == 200 ]] && printf '%s' "$OIDC_BODY" || exit 254 ;;
+  "sso-oidc create-token")
+    [[ "$OIDC_STATUS" == 0 ]] && { echo 'aws: [ERROR]: Could not connect to the endpoint URL: "https://x/token"' >&2; exit 255; }
+    [[ "$OIDC_STATUS" == 200 ]] && printf '%s' "$OIDC_BODY" || exit 254 ;;
   "sso login")
     sleep "${LOGIN_SLEEP:-0}"
     [[ "$LOGIN_RC" == 0 ]] || exit 1
@@ -403,6 +413,19 @@ fn dead_refresh_token_tries_one_browser_login() {
     assert_eq!((o.refresh_calls, o.logins, o.asks), (1, 1, 0));
     assert_eq!(o.access_token, "login");
     assert_eq!(o.rearm, Some(6 * 3600), "8h token, clamped to the 6h cap");
+}
+
+#[test]
+fn offline_refresh_retries_in_a_minute_without_a_browser_tab() {
+    let o = run(Scenario {
+        left: -60,
+        oidc: offline(),
+        ..Default::default()
+    });
+    assert_eq!((o.rc, o.refresh_calls, o.logins, o.asks), (0, 1, 0, 0));
+    assert!(line(&o, "sg-a: no network, retry in 1 min"), "{o:#?}");
+    assert!(approx(o.rearm.unwrap(), 60));
+    assert!(o.markers.is_empty(), "offline is not a dead session");
 }
 
 #[test]
@@ -903,6 +926,24 @@ fn shim_logs_in_once_when_the_session_is_over_then_runs_the_call() {
             "aws sso login --sso-session sg-a",
             "aws --profile sg-shim-login eks get-token"
         ]
+    );
+}
+
+#[test]
+fn shim_offline_opens_no_tab_and_still_runs_the_call() {
+    let s = Scenario {
+        profile: "sg-shim-offline",
+        left: -300,
+        oidc: offline(),
+        ..Default::default()
+    };
+    let o = shim(s, &["--profile", "sg-shim-offline", "s3", "ls"], &[]);
+    assert_eq!(o.logins, 0, "{}", o.calls);
+    assert!(line(&o, "sg-a: no network, not logging in"), "{o:#?}");
+    assert!(
+        o.calls.ends_with("aws --profile sg-shim-offline s3 ls\n"),
+        "{}",
+        o.calls
     );
 }
 
