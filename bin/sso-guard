@@ -195,7 +195,18 @@ ensure_session() { # $1 = session name -> 0 once it has a usable token
     url=$(sessions | awk -F'\t' -v n="$name" '$1 == n { print $2 }')
     [[ -n "$url" ]] || { echo "sso-guard: no sso-session '$name' in $CONFIG" >&2; return 1; }
     exec 9>"$STATE/$name.lock"
-    flock -w 660 9 || return 1 # a login in flight times out after ~10 min
+    if ! flock -n 9; then
+        # `sso-guard login` is a human at the keyboard: the tab the timer
+        # opened (at boot, on another workspace...) is likely unseen, so
+        # replace it with one in front of them instead of a silent 10 min wait.
+        if [[ -n "${TAKEOVER:-}" ]]; then
+            echo "sso-guard: $name: replacing the login already open in the browser" >&2
+            pkill -u "$USER" -f "sso login --sso-session $name\$" || true
+        else
+            echo "sso-guard: $name: login already in progress, waiting for it" >&2
+        fi
+        flock -w 660 9 || return 1 # a login in flight times out after ~10 min
+    fi
     fresh() { (( $(expiry_for "$url") - $(date +%s) > 60 )); }
     fresh && return 0 # another caller just logged in
     local rr=0
@@ -215,13 +226,14 @@ ensure_session() { # $1 = session name -> 0 once it has a usable token
     # pipe (a script, an agent's shell) is not held open by the browser.
     local log pid rc=0
     log=$(mktemp)
-    aws sso login --sso-session "$name" >"$log" 2>&1 &
+    aws sso login --sso-session "$name" >"$log" 2>&1 9>&- &
     pid=$!
     tail -n +1 -s 0.2 -f --pid="$pid" "$log" >&2
     wait "$pid" || rc=$?
     rm -f "$log"
     (( rc == 0 )) || return 1
     rm -f "$STATE/$name.needs-you" "$STATE/$name.needs-you.dismissed"
+    systemctl --user stop "sso-guard-ask-$name" >/dev/null 2>&1 || true # stale "log in" notification
 }
 
 if [[ ${1:-} == ensure ]]; then
@@ -242,6 +254,10 @@ if [[ ${1:-} == login ]]; then
         fi
     fi
     declare -A job=()
+    TAKEOVER=1
+    # Background jobs ignore Ctrl-C: take them (and their aws/flock) down
+    # with us, or each would open its own tab once the lock frees.
+    trap 'for p in "${job[@]}"; do pkill -P "$p"; kill "$p"; done 2>/dev/null; exit 130' INT TERM
     for n in "${names[@]}"; do ensure_session "$n" </dev/null & job[$n]=$!; done
     rc=0
     for n in "${names[@]}"; do
@@ -324,7 +340,7 @@ check_session() { # $1 = name, $2 = start url
             echo "sso-guard: $name login already in progress (aws shim)"
             exec 9>&-; want $(( now + 120 )); return 0
         fi
-        ok=0; aws sso login --sso-session "$name" && ok=1
+        ok=0; aws sso login --sso-session "$name" 9>&- && ok=1 # the browser it spawns must not inherit the lock
         exec 9>&-
         if (( ok )); then
             track "$(expiry_for "$url")"

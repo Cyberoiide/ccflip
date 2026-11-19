@@ -28,7 +28,7 @@ case "$*" in
     [[ -n "${OFFLINE:-}" ]] && echo 'aws: [ERROR]: Could not connect to the endpoint URL: "https://x/token"' >&2
     exit 1 ;;
   "sso login --sso-session "*)
-    s=${!#}; sleep 2
+    s=${!#}; sleep "${SLOW:-2}"
     # Like a browser: a child that inherits our fds and outlives the login.
     [[ -n "${LINGER:-}" ]] && { sleep 30 & }
     [[ " ${LOGIN_FAIL:-} " == *" $s "* ]] && exit 1
@@ -58,7 +58,7 @@ expire() { # every session's token expired 5 min ago, refresh token dead
     done
 }
 reset() { : > "$CALLS"; rm -rf "$XDG_STATE_HOME"; rm -f "$CCFLIP_POLICY"; expire
-          unset SSO_GUARD_SESSIONS SSO_GUARD_BROWSER LOGIN_FAIL TIMER_RC LINGER OFFLINE; export DISPLAY=:0; }
+          unset SSO_GUARD_SESSIONS SSO_GUARD_BROWSER LOGIN_FAIL TIMER_RC LINGER OFFLINE SLOW; export DISPLAY=:0; }
 logins() { grep -c "^sso login" "$CALLS" || true; }
 fail() { echo "FAIL: $*"; echo "--- calls"; cat "$CALLS"; exit 1; }
 timed() { local t0=$SECONDS r=0; "$@" || r=$?; elapsed=$(( SECONDS - t0 )); return "$r"; }
@@ -109,6 +109,23 @@ bin/sso-guard login strat >/dev/null 2>&1 && fail "offline login should fail"
 reset; export LINGER=1
 timed bash -c 'bin/sso-guard login strat 2>&1 | cat >/dev/null'
 (( elapsed < 6 )) || fail "browser held the pipe: ${elapsed}s"
+pkill -f '^sleep 30$' || true
+
+# The timer's login holds the lock (its tab unseen): `login` replaces it at
+# once instead of waiting silently for the 10 min timeout.
+reset; echo 'SSO_GUARD_SESSIONS=strat' > "$CCFLIP_POLICY"
+SLOW=30 bin/sso-guard >/dev/null 2>&1 & g=$!
+until grep -q "^sso login" "$CALLS"; do sleep 0.1; done
+timed bin/sso-guard login strat > "$T/out" 2>&1 || fail "takeover login: $(cat "$T/out")"
+(( elapsed < 6 )) || fail "login waited on the timer's tab: ${elapsed}s"
+grep -q "strat: replacing the login already open" "$T/out" || fail "takeover msg: $(cat "$T/out")"
+wait "$g" || true
+
+# Killing `login` (Ctrl-C) takes its jobs down: no orphan opens a tab later.
+reset; SLOW=30 bin/sso-guard login strat >/dev/null 2>&1 & l=$!
+until grep -q "^sso login" "$CALLS"; do sleep 0.1; done
+kill -TERM "$l"; wait "$l" || true; sleep 0.5
+! pgrep -f "sso-guard login strat|aws sso login --sso-session strat" >/dev/null || fail "login left orphans"
 pkill -f '^sleep 30$' || true
 
 echo OK

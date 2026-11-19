@@ -153,7 +153,10 @@ shim and your shell all read the same value; the environment still wins.
 `SSO_GUARD_BROWSER` is the old name. Sessions are checked in parallel, so one
 login waiting ~10 min on the browser never delays the others.
 `sso-guard login [session...]` logs in to every listed session at once and
-reports `ok`/`FAILED` per session. It works even while `sso-off`.
+reports `ok`/`FAILED` per session. It works even while `sso-off`. If the
+timer already has a login open (a tab you may never have seen, e.g. at boot),
+`login` replaces it with a fresh tab instead of waiting on it; Ctrl-C stops
+every session's login with it.
 
 **No network is not a dead session.** If the refresh call can't reach AWS
 (right after resume, before Wi-Fi is back), the guard opens no browser tab
