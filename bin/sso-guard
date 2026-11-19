@@ -67,22 +67,32 @@ sessions() {
 # the new access token back into the cache file. An STS call does NOT do this:
 # it is served from cached role creds (~/.aws/cli/cache) and never touches the
 # SSO token, so every run used to fall through to a browser login + consent.
-refresh_silently() { # $1 = start_url -> 0 if refreshed
-    local f r tmp
+#
+# Offline is not a dead session: right after resume the timer fires before
+# Wi-Fi is back, and a browser tab opened then loads an error page and sits
+# there until the login times out. So no network -> 2 and the caller retries.
+refresh_silently() { # $1 = start_url -> 0 refreshed, 1 dead, 2 offline
+    local f r tmp err offline=0
+    err=$(mktemp)
     for f in "$HOME"/.aws/sso/cache/*.json; do
         [[ -e "$f" ]] || continue
         jq -e --arg u "$1" '.startUrl == $u and .refreshToken and .clientSecret' "$f" >/dev/null 2>&1 || continue
-        r=$(aws sso-oidc create-token --output json --region "$(jq -r .region "$f")" \
+        if ! r=$(aws sso-oidc create-token --output json --region "$(jq -r .region "$f")" \
             --grant-type refresh_token --client-id "$(jq -r .clientId "$f")" \
             --client-secret "$(jq -r .clientSecret "$f")" \
-            --refresh-token "$(jq -r .refreshToken "$f")" 2>/dev/null) || continue
+            --refresh-token "$(jq -r .refreshToken "$f")" 2>"$err"); then
+            # botocore's EndpointConnectionError / connect and read timeouts
+            grep -qE 'endpoint URL' "$err" && offline=1
+            continue
+        fi
         tmp=$(mktemp "$f.XXXX")
         jq --argjson r "$r" --arg e "$(date -u -d "+$(jq -r .expiresIn <<<"$r") sec" +%FT%TZ)" \
             '.accessToken = $r.accessToken | .refreshToken = ($r.refreshToken // .refreshToken) | .expiresAt = $e' \
-            "$f" >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$f" && return 0
+            "$f" >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$f" && { rm -f "$err"; return 0; }
         rm -f "$tmp"
     done
-    return 1
+    rm -f "$err"
+    return $(( offline ? 2 : 1 ))
 }
 
 # Is anything running against this sso-session right now? Scans our own
@@ -188,7 +198,13 @@ ensure_session() { # $1 = session name -> 0 once it has a usable token
     flock -w 660 9 || return 1 # a login in flight times out after ~10 min
     fresh() { (( $(expiry_for "$url") - $(date +%s) > 60 )); }
     fresh && return 0 # another caller just logged in
-    refresh_silently "$url" && fresh && return 0
+    local rr=0
+    refresh_silently "$url" || rr=$?
+    (( rr == 0 )) && fresh && return 0
+    if (( rr == 2 )); then
+        echo "sso-guard: $name: no network, not logging in" >&2
+        return 1
+    fi
     if [[ -z "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
         echo "sso-guard: $name needs interactive login (no display): aws sso login --sso-session $name" >&2
         return 1
@@ -269,7 +285,13 @@ check_session() { # $1 = name, $2 = start url
 
     # Access token low: mint a fresh one from the refresh token (no browser)
     # while the IdC session still lives.
-    if refresh_silently "$url"; then
+    local rr=0
+    refresh_silently "$url" || rr=$?
+    if (( rr == 2 )); then
+        echo "sso-guard: $name: no network, retry in 1 min"
+        want $(( now + 60 )); return 0
+    fi
+    if (( rr == 0 )); then
         e=$(expiry_for "$url")
         # A full refresh buys ~60 min. Less means the IdC session itself
         # ends at $e: further refreshes or a browser login before then reuse

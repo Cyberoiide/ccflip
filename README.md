@@ -155,6 +155,11 @@ login waiting ~10 min on the browser never delays the others.
 `sso-guard login [session...]` logs in to every listed session at once and
 reports `ok`/`FAILED` per session. It works even while `sso-off`.
 
+**No network is not a dead session.** If the refresh call can't reach AWS
+(right after resume, before Wi-Fi is back), the guard opens no browser tab
+and retries in 1 min. A tab opened offline loads an error page and sits there
+until the login times out.
+
 **On-demand login (`bin/aws` shim).** Sessions outside `SSO_GUARD_SESSIONS`
 lapse while unused. With a 1h Identity Center cap, that means after every
 break. Link `bin/aws` as `~/.local/bin/aws`, ahead of the real `aws` on PATH.
