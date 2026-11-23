@@ -24,7 +24,8 @@ cat > "$HOME/.local/bin/aws" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >> "$CALLS"
 case "$*" in
-  *create-token*) # every IdC session is over, or the network is down
+  *create-token*) # every IdC session is over (unless REFRESH_IN), or the network is down
+    [[ -n "${REFRESH_IN:-}" ]] && { echo "{\"accessToken\":\"new\",\"expiresIn\":$REFRESH_IN}"; exit 0; }
     [[ -n "${OFFLINE:-}" ]] && echo 'aws: [ERROR]: Could not connect to the endpoint URL: "https://x/token"' >&2
     exit 1 ;;
   "sso login --sso-session "*)
@@ -34,6 +35,8 @@ case "$*" in
     [[ " ${LOGIN_FAIL:-} " == *" $s "* ]] && exit 1
     f="$HOME/.aws/sso/cache/$(printf %s "$s" | sha1sum | cut -c1-40).json"
     jq --arg e "$(date -u -d '+1 hour' +%FT%TZ)" '.expiresAt = $e' "$f" > "$f.t" && mv "$f.t" "$f" ;;
+  "sts get-caller-identity --profile "*) # mint 1h role creds where botocore caches them
+    jq -n --arg e "$(date -u -d '+1 hour' +%FT%TZ)" '{Credentials: {Expiration: $e}}' > "$(cat "$HOME/key-${!#}")" ;;
 esac
 EOF
 chmod +x "$HOME/.local/bin/"*
@@ -48,7 +51,18 @@ sso_session = heka
 sso_start_url = https://strat.example/start
 [profile s]
 sso_session = strat
+sso_account_id = 222
+sso_role_name = Admin
+[profile s2]
+sso_session = strat
+sso_account_id = 333
+sso_role_name = Admin
 EOF
+mkdir -p "$HOME/.aws/cli/cache"
+for p in s:222 s2:333; do # where botocore caches each profile's role creds
+    printf '%s/.aws/cli/cache/%s.json' "$HOME" "$(printf '{"accountId":"%s","roleName":"Admin","sessionName":"strat"}' \
+        "${p#*:}" | sha1sum | cut -c1-40)" > "$HOME/key-${p%:*}"
+done
 expire() { # every session's token expired 5 min ago, refresh token dead
     for n in heka strat; do
         jq -n --arg u "https://$n.example/start" --arg e "$(date -u -d '-5 min' +%FT%TZ)" \
@@ -58,7 +72,8 @@ expire() { # every session's token expired 5 min ago, refresh token dead
     done
 }
 reset() { : > "$CALLS"; rm -rf "$XDG_STATE_HOME"; rm -f "$CCFLIP_POLICY"; expire
-          unset SSO_GUARD_SESSIONS SSO_GUARD_BROWSER LOGIN_FAIL TIMER_RC LINGER OFFLINE SLOW; export DISPLAY=:0; }
+          unset SSO_GUARD_SESSIONS SSO_GUARD_BROWSER LOGIN_FAIL TIMER_RC LINGER OFFLINE SLOW REFRESH_IN
+          rm -f "$HOME"/.aws/cli/cache/*; export DISPLAY=:0; }
 logins() { grep -c "^sso login" "$CALLS" || true; }
 fail() { echo "FAIL: $*"; echo "--- calls"; cat "$CALLS"; exit 1; }
 timed() { local t0=$SECONDS r=0; "$@" || r=$?; elapsed=$(( SECONDS - t0 )); return "$r"; }
@@ -125,7 +140,28 @@ wait "$g" || true
 reset; SLOW=30 bin/sso-guard login strat >/dev/null 2>&1 & l=$!
 until grep -q "^sso login" "$CALLS"; do sleep 0.1; done
 kill -TERM "$l"; wait "$l" || true; sleep 0.5
-! pgrep -f "sso-guard login strat|aws sso login --sso-session strat" >/dev/null || fail "login left orphans"
+! pgrep -f "sso-guard login strat$|aws sso login --sso-session strat$" >/dev/null || fail "login left orphans"
 pkill -f '^sleep 30$' || true
+
+# Session ends in 10 min: no bank yet, wake 2 min before the end.
+reset; echo 'SSO_GUARD_SESSIONS=strat' > "$CCFLIP_POLICY"; export REFRESH_IN=600
+out=$(bin/sso-guard)
+grep -q "strat session ends" <<<"$out" && grep -qE "next check in [78] min" <<<"$out" || fail "bank wake: $out"
+grep -q "^sts" "$CALLS" && fail "banked too early"
+
+# 2 min left: the used profile's creds are re-minted to outlive the session,
+# keeping the mtime of its last real use; the unused one is left alone.
+reset; echo 'SSO_GUARD_SESSIONS=strat' > "$CCFLIP_POLICY"; export REFRESH_IN=100
+jq -n --arg e "$(date -u -d '+50 min' +%FT%TZ)" '{Credentials: {Expiration: $e}}' > "$(cat "$HOME/key-s")"
+touch -d '-10 min' "$(cat "$HOME/key-s")"
+jq -n --arg e "$(date -u -d '-1 hour' +%FT%TZ)" '{Credentials: {Expiration: $e}}' > "$(cat "$HOME/key-s2")"
+touch -d '-2 hour' "$(cat "$HOME/key-s2")"
+m=$(stat -c %Y "$(cat "$HOME/key-s")")
+out=$(bin/sso-guard)
+grep -q "strat: s creds banked until" <<<"$out" || fail "not banked: $out"
+(( $(date -d "$(jq -r .Credentials.Expiration "$(cat "$HOME/key-s")")" +%s) > $(date +%s) + 3000 )) || fail "bank not fresh"
+[[ $(stat -c %Y "$(cat "$HOME/key-s")") == "$m" ]] || fail "bank faked a use"
+[[ $(grep -c "^sts" "$CALLS") == 1 && $(logins) == 0 ]] || fail "bank: wrong calls"
+! ls "$HOME"/.aws/cli/cache/*.old >/dev/null 2>&1 || fail "bank left a backup"
 
 echo OK

@@ -35,15 +35,26 @@ done
 [[ -n "${AWS_ACCESS_KEY_ID:-}" && $explicit == 0 ]] && skip=1
 
 if (( ! skip )) && [[ -n "$profile" ]]; then
-    session=$(awk -v p="$profile" '
+    read -r session acct role < <(awk -v p="$profile" '
         /^\[/ { inp = ($0 == "[profile " p "]" || (p == "default" && $0 == "[default]")); next }
-        inp && $1 == "sso_session" { print $3; exit }' "${AWS_CONFIG_FILE:-$HOME/.aws/config}" 2>/dev/null)
+        inp && $1 == "sso_session" { s = $3 }
+        inp && $1 == "sso_account_id" { a = $3 }
+        inp && $1 == "sso_role_name" { r = $3 }
+        END { if (s) print s, a, r }' "${AWS_CONFIG_FILE:-$HOME/.aws/config}" 2>/dev/null)
     if [[ -n "$session" ]]; then
-        # botocore names the token file after the sha1 of the session name.
+        # botocore names the token file after the sha1 of the session name,
+        # the role creds one after the sha1 of this JSON.
         f="$HOME/.aws/sso/cache/$(printf %s "$session" | sha1sum | cut -c1-40).json"
+        c="$HOME/.aws/cli/cache/$(printf '{"accountId":"%s","roleName":"%s","sessionName":"%s"}' \
+            "$acct" "$role" "$session" | sha1sum | cut -c1-40).json"
         exp=$(jq -r '.expiresAt // empty' "$f" 2>/dev/null)
         e=$(date -d "${exp:-@0}" +%s 2>/dev/null || echo 0)
-        if (( e - $(date +%s) <= 30 )); then
+        exp=$(jq -r '.Credentials.Expiration // empty' "$c" 2>/dev/null)
+        ce=$(date -d "${exp:-@0}" +%s 2>/dev/null || echo 0)
+        # Role creds the real aws still serves without the token (it does until
+        # 15 min before they expire, +1 min slack), e.g. banked by sso-guard
+        # before the session ended: no login needed yet.
+        if (( e - $(date +%s) <= 30 && ce - $(date +%s) <= 960 )); then
             # stderr only: kubectl parses this command's stdout as JSON.
             "$(dirname "$self")/sso-guard" ensure "$session" >&2 || true
         fi

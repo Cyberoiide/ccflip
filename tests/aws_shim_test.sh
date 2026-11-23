@@ -41,6 +41,7 @@ sso_region = eu-west-1
 [profile strat-staging]
 sso_session = strat
 sso_account_id = 111
+sso_role_name = Admin
 
 [profile plain]
 region = eu-west-1
@@ -80,6 +81,21 @@ reset; token '-5 min'; export LOGIN_OK=1 LOGIN_SLEEP=1 DISPLAY=:0
 for _ in 1 2 3; do aws --profile=strat-staging sts get-caller-identity >/dev/null & done; wait
 [[ $(grep -c "sso login" "$CALLS") == 1 ]] || fail "parallel: $(grep -c 'sso login' "$CALLS") logins"
 [[ $(grep -c "REAL\|sts get-caller-identity" "$CALLS") == 3 ]] || fail "parallel: not all ran"
+
+# Expired, but role creds (banked) still serve the call: no refresh, no login.
+# Under 16 min left, the real aws would need the token: log in.
+CREDS="$HOME/.aws/cli/cache/$(printf '{"accountId":"111","roleName":"Admin","sessionName":"strat"}' | sha1sum | cut -c1-40).json"
+mkdir -p "$HOME/.aws/cli/cache"
+reset; token '-5 min'; export LOGIN_OK=1 DISPLAY=:0
+jq -n --arg e "$(date -u -d '+40 min' +%FT%TZ)" '{Credentials: {Expiration: $e}}' > "$CREDS"
+out=$(aws --profile strat-staging sts get-caller-identity)
+[[ "$out" == "REAL --profile strat-staging sts get-caller-identity" ]] || fail "banked: $out"
+grep -q "create-token\|sso login" "$CALLS" && fail "banked creds ignored"
+reset; token '-5 min'; export LOGIN_OK=1 DISPLAY=:0
+jq -n --arg e "$(date -u -d '+10 min' +%FT%TZ)" '{Credentials: {Expiration: $e}}' > "$CREDS"
+aws --profile strat-staging sts get-caller-identity >/dev/null 2>&1
+grep -q "sso login" "$CALLS" || fail "near-expiry banked creds should log in"
+rm -f "$CREDS"
 
 # No display: no login attempt, the real command still runs, its rc kept.
 reset; token '-5 min'; export REAL_RC=3

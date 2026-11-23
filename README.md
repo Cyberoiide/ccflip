@@ -174,6 +174,19 @@ callers like k9s open a single tab. Then the real `aws` runs. kubectl's
 "Token has expired" after a break. Tools that read the SSO cache without
 spawning `aws` (Terraform, boto3 scripts) don't get this.
 
+**Role creds outlive the session.** The Identity Center cap ends the SSO
+token, not the role credentials minted from it: those live out their
+permission-set duration (1h), and the CLI serves them from `~/.aws/cli/cache`
+without the token until 15 min before they expire. So 2 min before a session
+ends, the guard re-mints the role creds of every profile used in the last
+hour (`<session>: <profile> creds banked until HH:MM`). `aws`, kubectl and
+tunnels then keep working ~45 min past the end, and the re-login lands in
+that window instead of after a hard stop. The shim skips the login while a
+profile's banked creds still serve the call. AWS documents this ("refresh
+your permission set just before the IAM Identity Center session is set to
+expire"); nothing changes on the AWS side. Terraform and the Go/JS SDKs don't
+read the CLI cache, so they still stop at the session end.
+
 ## Gotchas
 
 - Never run `cswap run` from a shell still carrying `CLAUDE_CODE_USE_BEDROCK=1`:
