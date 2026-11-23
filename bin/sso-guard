@@ -19,7 +19,7 @@
 # before the earliest token crosses the threshold. The static hourly timer
 # is only the reboot-safe backstop.
 set -euo pipefail
-export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+export PATH="$HOME/.local/bin:/usr/local/bin:$PATH:/home/linuxbrew/.linuxbrew/bin"
 
 # SSO_GUARD_* knobs from policy.env, the environment still winning (as in
 # ccflip): one place the timer, the aws shim and your shell all read. Parsed,
@@ -37,7 +37,7 @@ fi
 # sso-off disables the backstop timer; a run already in flight (or a stale
 # sso-guard-next) must then do nothing and not re-arm itself. An explicit
 # `sso-guard login` still works.
-if [[ ${1:-} != login ]] && ! systemctl --user is-enabled --quiet sso-guard.timer 2>/dev/null; then
+if [[ ! ${1:-} =~ ^(login|push|receive)$ ]] && ! systemctl --user is-enabled --quiet sso-guard.timer 2>/dev/null; then
     echo "sso-guard: disabled (sso-off), skipping"
     exit 0
 fi
@@ -182,6 +182,43 @@ bank_creds() { # $1 = session name
         inp && $1 == "sso_session" && $3 == s { sess = 1 }
         END { flush() }' "$CONFIG")
 }
+
+# Headless hosts (SSO_GUARD_PUSH, e.g. an EC2 box with no browser) can't log
+# in themselves. `push` (sso-push.path runs it on every token change) sends
+# them this machine's access tokens; `receive` there files each one under every
+# local session with the same start URL, so session names may differ. No
+# refresh token or client secret leaves: the host can't refresh (so it never
+# rotates ours) and a stolen copy is worth one hour at most. Pushed again 2 min
+# before the session ends, the host banks its own role creds then.
+if [[ ${1:-} == push ]]; then
+    rc=0
+    for h in ${SSO_GUARD_PUSH:-}; do
+        jq -c 'select(.startUrl and .accessToken and .expiresAt) | {startUrl, region, accessToken, expiresAt}' \
+            "$HOME"/.aws/sso/cache/*.json 2>/dev/null \
+            | ssh -o BatchMode=yes -o ConnectTimeout=10 "$h" '~/.local/bin/sso-guard receive' \
+            || { echo "sso-guard: push to $h failed" >&2; rc=1; }
+    done
+    exit "$rc"
+fi
+if [[ ${1:-} == receive ]]; then
+    mkdir -p "$HOME/.aws/sso/cache"
+    while IFS= read -r t; do
+        u=$(jq -r .startUrl <<<"$t")
+        e=$(date -d "$(jq -r .expiresAt <<<"$t")" +%s)
+        while IFS=$'\t' read -r name url _; do
+            [[ "$url" == "$u" ]] || continue
+            f="$HOME/.aws/sso/cache/$(printf %s "$name" | sha1sum | cut -c1-40).json"
+            old=$(jq -r '.expiresAt // empty' "$f" 2>/dev/null) || old=""
+            if (( e > $(date -d "${old:-@0}" +%s 2>/dev/null || echo 0) )); then
+                tmp=$(mktemp "$f.XXXX") # 0600
+                printf '%s\n' "$t" >"$tmp" && mv "$tmp" "$f"
+                echo "sso-guard: $(hostname): $name token until $(date -d "@$e" +%H:%M)"
+            fi
+            if (( e > $(date +%s) && e - $(date +%s) <= 180 )); then bank_creds "$name"; fi
+        done < <(sessions)
+    done
+    exit 0
+fi
 
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/sso-guard"
 mkdir -p "$STATE"
@@ -350,7 +387,7 @@ check_session() { # $1 = name, $2 = start url
         fi
         echo "sso-guard: $name session ends $(date -d "@$e" +%H:%M), login then"
         # Bank role creds 2 min before the end: as late as possible, so they outlive it most.
-        if (( e - now > 180 )); then want $(( e - 120 )); else bank_creds "$name"; fi
+        if (( e - now > 180 )); then want $(( e - 120 )); else bank_creds "$name"; "$0" push || true; fi
         want $(( e + 30 )); return 0
     fi
 

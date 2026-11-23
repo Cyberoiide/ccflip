@@ -187,6 +187,19 @@ your permission set just before the IAM Identity Center session is set to
 expire"); nothing changes on the AWS side. Terraform and the Go/JS SDKs don't
 read the CLI cache, so they still stop at the session end.
 
+**Headless hosts get pushed tokens (`SSO_GUARD_PUSH`).** A box with no
+browser (claude-host) can't log in at all. List it in `policy.env`
+(`SSO_GUARD_PUSH="claude-host"`, ssh host names) and enable
+`systemd/sso-push.path`: every time this machine's token cache changes, the
+guard pipes the access tokens over ssh to `sso-guard receive` on the host
+(copy `bin/sso-guard` to its `~/.local/bin`). The host files each token under
+its own session with the same start URL, so names may differ (`heka` here,
+`heka-aws` there). The refresh token and client secret never leave: the host
+can't refresh, so it never rotates ours. The guard pushes again 2 min before a
+session ends, and the host banks its own used profiles then, like here. The
+host stays logged in exactly while this machine does. When this machine
+sleeps through a session end, the host's session lapses until it wakes.
+
 ## Gotchas
 
 - Never run `cswap run` from a shell still carrying `CLAUDE_CODE_USE_BEDROCK=1`:
