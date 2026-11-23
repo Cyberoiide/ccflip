@@ -1,0 +1,8 @@
+[Unit]
+Description=Push fresh AWS SSO tokens to headless hosts (SSO_GUARD_PUSH)
+
+[Path]
+PathChanged=%h/.aws/sso/cache
+
+[Install]
+WantedBy=default.target

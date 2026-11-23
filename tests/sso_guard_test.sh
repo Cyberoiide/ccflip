@@ -164,4 +164,49 @@ grep -q "strat: s creds banked until" <<<"$out" || fail "not banked: $out"
 [[ $(grep -c "^sts" "$CALLS") == 1 && $(logins) == 0 ]] || fail "bank: wrong calls"
 ! ls "$HOME"/.aws/cli/cache/*.old >/dev/null 2>&1 || fail "bank left a backup"
 
+# push/receive: a headless host gets the access token under its own session
+# name (same start URL), never the refresh token or client secret; an older
+# token never overwrites a newer one; 2 min before the end it banks its own
+# used profiles' creds.
+R="$T/remote"; mkdir -p "$R/.local/bin" "$R/.aws/cli/cache"
+cp "$HOME/.local/bin/aws" "$HOME/.local/bin/systemctl" "$R/.local/bin/"
+ln -s "$PWD/bin/sso-guard" "$R/.local/bin/sso-guard"
+cat > "$HOME/.local/bin/ssh" <<EOF
+#!/usr/bin/env bash
+echo "ssh \${@: -2:1}" >> "\$CALLS"
+HOME="$R" bash -c "\${!#}"
+EOF
+chmod +x "$HOME/.local/bin/ssh"
+cat > "$R/.aws/config" <<'EOF'
+[sso-session strat-x]
+sso_start_url = https://strat.example/start
+[profile r]
+sso_session = strat-x
+sso_account_id = 444
+sso_role_name = Admin
+EOF
+RT="$R/.aws/sso/cache/$(printf strat-x | sha1sum | cut -c1-40).json"
+RC="$R/.aws/cli/cache/$(printf '{"accountId":"444","roleName":"Admin","sessionName":"strat-x"}' | sha1sum | cut -c1-40).json"
+echo "$RC" > "$R/key-r"
+LT="$HOME/.aws/sso/cache/$(printf strat | sha1sum | cut -c1-40).json"
+fresh() { jq --arg e "$(date -u -d "$1" +%FT%TZ)" '.expiresAt = $e' "$LT" > "$LT.t" && mv "$LT.t" "$LT"; }
+
+reset; bin/sso-guard push || fail "push with no hosts"
+[[ ! -s "$CALLS" ]] || fail "push with no hosts called out"
+reset; export SSO_GUARD_PUSH=box; fresh '+50 min'
+out=$(bin/sso-guard push) || fail "push: $out"
+grep -q "strat-x token until" <<<"$out" || fail "push not received: $out"
+[[ $(jq -r .accessToken "$RT") == old ]] || fail "token not filed under the host's session"
+[[ $(jq -r '.refreshToken // .clientSecret // .clientId // "none"' "$RT") == none ]] || fail "secrets pushed"
+[[ $(stat -c %a "$RT") == 600 ]] || fail "pushed token mode $(stat -c %a "$RT")"
+fresh '+20 min'; bin/sso-guard push >/dev/null
+(( $(date -d "$(jq -r .expiresAt "$RT")" +%s) > $(date +%s) + 2400 )) || fail "older token overwrote a newer one"
+grep -q "^sts" "$CALLS" && fail "banked too early on the host"
+
+reset; export SSO_GUARD_PUSH=box; rm -f "$RT"; fresh '+100 sec'
+jq -n --arg e "$(date -u -d '+50 min' +%FT%TZ)" '{Credentials: {Expiration: $e}}' > "$RC"; touch -d '-10 min' "$RC"
+out=$(bin/sso-guard push)
+grep -q "strat-x: r creds banked until" <<<"$out" || fail "host did not bank: $out"
+unset SSO_GUARD_PUSH
+
 echo OK

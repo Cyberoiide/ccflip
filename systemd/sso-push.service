@@ -1,0 +1,6 @@
+[Unit]
+Description=Push fresh AWS SSO tokens to headless hosts (SSO_GUARD_PUSH)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/sso-guard push
