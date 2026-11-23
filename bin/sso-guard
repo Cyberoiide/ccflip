@@ -132,7 +132,8 @@ in_use() { # $1 = session name -> 0 + "pid cmd" if used
 
 # Recent use: every real use of a profile mints role creds into the CLI
 # cache, tagged with the account id, at least hourly while use continues
-# (role creds live 1h). sso-guard itself never mints any. Catches pollers
+# (role creds live 1h). The ones bank_creds mints keep the mtime of the
+# last real use, so they never count as use. Catches pollers
 # whose own argv/env carry no profile (only their short-lived children do).
 used_recently() { # $1 = session name -> 0 + "acct ... minted HH:MM" if used
     local accts f a
@@ -149,6 +150,37 @@ used_recently() { # $1 = session name -> 0 + "acct ... minted HH:MM" if used
         fi
     done < <(find "$HOME/.aws/cli/cache" -maxdepth 1 -name '*.json' -mmin -65 2>/dev/null)
     return 1
+}
+
+# The IdC session caps the SSO token, not the role creds minted from it: STS
+# creds live out their permission-set duration (1h) even after the session
+# ends, and the CLI serves them from ~/.aws/cli/cache without reading the
+# token until 15 min before they expire. So right before the end, re-mint
+# those of every profile in real use: aws, kubectl and tunnels keep working
+# ~45 min past it, a window for the re-login instead of a hard stop.
+# shortcut: CLI cache only; the Go/JS SDKs (terraform) still stop at the end.
+bank_creds() { # $1 = session name
+    local p acct role f m
+    while read -r p acct role; do
+        f="$HOME/.aws/cli/cache/$(printf '{"accountId":"%s","roleName":"%s","sessionName":"%s"}' \
+            "$acct" "$role" "$1" | sha1sum | cut -c1-40).json" # botocore's cache key
+        [[ -n "$(find "$f" -mmin -65 2>/dev/null)" ]] || continue # unused: nothing to keep alive
+        m=$(stat -c %Y "$f")
+        mv "$f" "$f.old"
+        if aws sts get-caller-identity --profile "$p" >/dev/null 2>&1 && [[ -e "$f" ]]; then
+            rm -f "$f.old"
+            touch -d "@$m" "$f"
+            echo "sso-guard: $1: $p creds banked until $(date -d "$(jq -r .Credentials.Expiration "$f")" +%H:%M)"
+        else
+            mv -n "$f.old" "$f"; rm -f "$f.old"
+        fi
+    done < <(awk -v s="$1" '
+        function flush() { if (sess && acct && role) print prof, acct, role; sess = 0; acct = role = "" }
+        /^\[/ { flush(); inp = ($0 ~ /^\[profile /); prof = $2; sub(/\]$/, "", prof); next }
+        inp && $1 == "sso_account_id" { acct = $3 }
+        inp && $1 == "sso_role_name" { role = $3 }
+        inp && $1 == "sso_session" && $3 == s { sess = 1 }
+        END { flush() }' "$CONFIG")
 }
 
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/sso-guard"
@@ -317,6 +349,8 @@ check_session() { # $1 = name, $2 = start url
             track "$e"; return 0
         fi
         echo "sso-guard: $name session ends $(date -d "@$e" +%H:%M), login then"
+        # Bank role creds 2 min before the end: as late as possible, so they outlive it most.
+        if (( e - now > 180 )); then want $(( e - 120 )); else bank_creds "$name"; fi
         want $(( e + 30 )); return 0
     fi
 
